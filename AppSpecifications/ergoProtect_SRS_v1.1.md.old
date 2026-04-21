@@ -1,0 +1,1015 @@
+**ergoProtect**
+
+Software Requirements Specification
+
+*Version 1.1*
+
+Platform: Windows 10/11 • Debian Linux
+
+Language: Python 3.10+
+
+Architecture: Modular daemon/service with headless core
+
+---
+
+# 1 Overview
+
+ergoProtect is a background daemon/service that monitors keyboard and mouse usage to encourage healthy work habits. It logs activity to daily CSV files, enforces timed break reminders, and provides optional assistive input features (auto-click on mouse idle, keyboard-to-mouse button shortcuts). It has no persistent graphical interface; the only window it ever shows is a break-reminder popup.
+
+## 1.1 Module Map
+
+The application is split into the following Python modules:
+
+- **daemon_core** — process lifecycle, PID/mutex, config loading, cross-module event bus
+- **tray_gui** — tray application to interact with daemon_core and display GUI messages (Windows only, optional on Linux)
+- **os_abstraction** — thin layer that exposes identical APIs for Windows and Linux
+- **input_monitor** — low-level keyboard and mouse hooks
+- **activity_logger** — daily CSV writing and log-file maintenance
+- **break_enforcer** — pause timer logic and input-blocking coordination
+- **break_popup** — tkinter always-on-top GUI window with countdown
+- **auto_clicker** — idle-mouse auto-click feature (F10 toggle)
+- **key_remapper** — keyboard shortcut → mouse button simulation (F6–F9)
+
+## 1.2 Platform Abstraction Summary
+
+The following table summarizes key platform differences handled by os_abstraction:
+
+| **Feature**                | **Windows**                          | **Linux**                               |
+|----------------------------|--------------------------------------|-----------------------------------------|
+| Service/Daemon Type        | Windows Service (pywin32)            | systemd user unit                       |
+| Single Instance            | Named mutex (Global\ergoProtectMutex)| PID file (ergoprotect.pid)              |
+| Input Hooks                | pynput (WH_KEYBOARD_LL/WH_MOUSE_LL)  | pynput or evdev                         |
+| Input Blocking             | Low-level hook (pywin32)             | XGrabKeyboard/XGrabPointer (python-xlib)|
+| GUI Architecture           | Two-process (worker + tray)          | Single-process (optional tray)          |
+| IPC Mechanism              | Named pipe (\\.\pipe\ergoProtect)    | Not required (single process)           |
+| Display Server             | Windows API                          | X11 only (Wayland unsupported in v1.0)  |
+
+---
+
+# 2 Module: daemon_core
+
+## 2.1 Purpose
+
+Manages the full process lifecycle. Loads and validates configuration. Enforces single-instance operation. Provides a shared event bus used by all other modules. Exposes start / stop / status commands.
+
+## 2.2 Event Bus Specification
+
+The event bus is a thread-safe publish/subscribe system using non-blocking queues.
+
+- **Queue size:** 1000 events per subscriber
+- **Overflow behavior:** Oldest events are dropped (FIFO eviction)
+- **Delivery guarantee:** Best-effort; events may be dropped on overflow
+- **Ordering:** No cross-module ordering guarantee
+- **Thread safety:** All operations are thread-safe using locks
+
+Event publishers do not block on subscriber queue state. Slow subscribers may miss events if they cannot consume at the production rate.
+
+## 2.3 Python Version
+
+Python 3.10 or higher is required. The application must be packaged as a standalone executable for both platforms using PyInstaller (or equivalent). The executable names are:
+
+- **Windows:** ergoprotect-worker.exe (background service) + ergoprotect-tray.exe (GUI/tray process)
+- **Linux:** ergoprotect (single binary, may optionally launch tray component)
+
+## 2.4 Daemon / Service Behavior
+
+- **On Windows:** Run as a Windows Service using the pywin32 library (win32serviceutil). Supports the standard SCM verbs: start, stop, status.
+
+- **On Linux:** Run as a systemd user service (not system service). A ready-to-use unit file (ergoprotect.service) must be included in the distribution.
+
+- **Both platforms expose a CLI entry point:** `ergoprotect-worker start | stop | status` (Windows) or `ergoprotect start | stop | status` (Linux).
+
+- **User privileges:** The daemon/service runs as the logged-in user (not root/SYSTEM). Low-level input hooks via pynput or evdev do NOT require elevated privileges for typical user-session operation.
+
+> **Implementation note** On Linux, low-level input hooks via pynput or evdev may require the user account to be in the `input` group on some distributions. The installer or README must document this requirement: `sudo usermod -aG input $USER`
+
+## 2.5 Single-Instance Enforcement
+
+- **On Linux:** Write a PID file to the same folder as the executable (ergoprotect.pid). On startup, check whether the PID in the file corresponds to a running process; if so, abort with a clear error message: "ergoProtect is already running (PID: XXXX)".
+
+- **On Windows:** Create a named mutex (`Global\ergoProtectMutex`). If the mutex already exists, abort with a clear error message: "ergoProtect is already running. Only one instance is allowed."
+
+- The PID file is deleted cleanly on daemon shutdown. If the daemon crashes, a stale PID file may remain; the startup check must verify the PID is actually running (not just that the file exists).
+
+## 2.6 Configuration Loading
+
+The config file is always **config.ini**, located in the same folder as the executable — on both Windows and Linux. The application never looks for config.ini anywhere else.
+
+If config.ini is missing entirely, a default config.ini is created automatically on first run with all default values and a comment header explaining each parameter.
+
+If config.ini exists but a parameter is absent, the default value is used silently. If a parameter is present but contains an invalid value (wrong type, out of range, unrecognized key name), the default value is used and a WARNING is written to error.log.
+
+### Configuration Parameters
+
+| **Parameter**                  | **Default** | **Description**                                                                                                                                                                                                                                           |
+|--------------------------------|-------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| leftMouseClickKey              | F9          | Key that simulates a left mouse click (see key_remapper)                                                                                                                                                                                                 |
+| rightMouseClickKey             | F8          | Key that simulates a right mouse click                                                                                                                                                                                                                    |
+| leftMouseDoubleClickKey        | F7          | Key that simulates a left mouse double-click                                                                                                                                                                                                              |
+| leftMouseDragDropKey           | F6          | Key that toggles left-mouse-button hold (see key_remapper)                                                                                                                                                                                                |
+| activateDeactivateAutoClick    | F10         | Key that toggles the auto-click feature on/off                                                                                                                                                                                                            |
+| autoClickDelayInMs             | 200         | Milliseconds of mouse stillness before auto-click fires (range: 50–5000)                                                                                                                                                                                  |
+| autoClickMovementThresholdPx   | 3           | Pixel radius — movement within this radius is treated as 'still' (range: 1–50)                                                                                                                                                                            |
+| pauseTimerInMinutes            | 40          | Continuous activity minutes before break popup appears (range: 1–300)                                                                                                                                                                                     |
+| pauseTimerRestInMinutes        | 5           | Continuous rest minutes that reset the activity timer (range: 1–60)                                                                                                                                                                                       |
+| breakCountdownSeconds          | 180         | Seconds the break popup counts down before auto-closing (range: 30–600, default 3 min)                                                                                                                                                                    |
+| breakDelayMinutes              | 10          | Minutes added when user clicks 'Delay' (range: 1–60)                                                                                                                                                                                                      |
+| logMaintainDays                | 30          | CSV files older than this many days are deleted (range: 1–365)                                                                                                                                                                                            |
+| logFilePath                    | (empty)     | Path for CSV log files. Empty string or unset = same folder as executable. If set, must be an absolute path that exists and is writable; otherwise falls back to executable folder with WARNING logged.                                                  |
+| logTimezone                    | local       | Timezone for timestamps: 'local' or a valid tz database name (e.g., 'UTC', 'America/New_York'). Invalid values fall back to 'local' with WARNING.                                                                                                        |
+| breakPopupMonitor              | primary     | Which monitor to center the popup on: 'primary' or index 0, 1, 2... Index 0 always refers to the OS-designated primary monitor and is equivalent to 'primary'. Indices 1, 2, etc. refer to additional monitors. Invalid index falls back to primary.     |
+
+### 2.6.1 Configuration Validation Rules
+
+On startup, after loading config.ini:
+
+1. **Key binding conflicts:** If any two parameters that define key bindings (leftMouseClickKey, rightMouseClickKey, leftMouseDoubleClickKey, leftMouseDragDropKey, activateDeactivateAutoClick) contain the same key value, log an ERROR and abort startup with message: "Configuration error: Key 'X' is assigned to multiple functions. Each function key must be unique."
+
+2. **Numeric ranges:** All numeric parameters have min/max ranges as specified in the table above. Values outside these ranges are clamped to the nearest boundary with a WARNING logged.
+
+3. **Timezone validation:** If logTimezone is set to a value other than 'local', attempt to load it as a tz database name using Python's `zoneinfo` module. If it fails, fall back to 'local' and log a WARNING.
+
+4. **Monitor index validation:** If breakPopupMonitor is numeric, verify it is a non-negative integer. If it exceeds the available monitor count at runtime, fall back to primary monitor and log a WARNING.
+
+5. **Path validation:** If logFilePath is non-empty, verify it is an absolute path and the directory exists and is writable. If not, fall back to executable directory and log a WARNING.
+
+All validation warnings and errors are written to error.log before the daemon enters its main loop.
+
+## 2.7 Error Logging
+
+- All unhandled exceptions and configuration warnings are written to **error.log** in the same folder as the executable.
+
+- Each error log entry contains: ISO-8601 timestamp (in logTimezone), severity (INFO / WARNING / ERROR), module name, and message.
+
+- The error log is not rotated automatically in v1.0 (append-only). For v1.1, a 10 MB size cap will be implemented (see §12.3).
+
+- **Format example:**
+  ```
+  2025-06-01T14:32:15-04:00 [INFO] daemon_core: ergoProtect started (PID: 12345)
+  2025-06-01T14:35:22-04:00 [WARNING] daemon_core: logFilePath '/invalid/path' not accessible, using executable directory
+  2025-06-01T16:20:00-04:00 [ERROR] input_monitor: Failed to register keyboard hook: PermissionError
+  ```
+
+## 2.8 Startup Sequence
+
+1. Enforce single instance (PID file / mutex check).
+2. Load and validate config.ini (create with defaults if missing).
+3. Validate configuration parameters (§2.6.1). Abort on critical errors (e.g., key binding conflicts).
+4. Initialize all modules in dependency order: os_abstraction → input_monitor → activity_logger → break_enforcer → auto_clicker → key_remapper.
+5. **(Windows only)** Wait for tray process connection on named pipe or timeout after 10 seconds. If timeout occurs, log WARNING and continue (daemon operates headless; popup will fail until tray connects).
+6. Register OS hooks (keyboard + mouse). If critical hooks cannot be installed, the daemon must fail fast with clear error message in error.log.
+7. Write startup entry to error.log (INFO level): "ergoProtect started (PID: XXXX)".
+8. Enter main event loop.
+
+## 2.9 Shutdown Sequence
+
+1. Release any active drag-drop mouse hold immediately (inject mouse button-up event if needed).
+2. Deregister all OS hooks.
+3. Flush and close the daily CSV log.
+4. Close the break popup if it is open.
+5. Delete PID file (Linux) / release mutex (Windows).
+6. Write shutdown entry to error.log (INFO level): "ergoProtect stopped".
+
+## 2.10 Status Command
+
+The `status` command returns the current daemon/service state and runtime information:
+
+**Output format (text):**
+```
+ergoProtect status: RUNNING
+PID: 12345
+Uptime: 2h 34m 12s
+Activity timer: 38 minutes (break in 2 minutes)
+Auto-clicker: OFF
+Drag-drop mode: OFF
+Break popup: Not shown
+Last break: 2025-06-01 14:05:00 (expired)
+Log directory: /home/user/ergoprotect/
+Last error: None
+```
+
+**Possible states:** RUNNING, STOPPED, UNKNOWN (on Windows if service query fails)
+
+If the daemon is not running, output only:
+```
+ergoProtect status: STOPPED
+```
+
+---
+
+# 3 Module: os_abstraction
+
+## 3.1 Purpose
+
+Provides a single, OS-agnostic API surface for all platform-specific operations. No other module imports platform-specific libraries directly (e.g., pywin32, python-xlib, evdev).
+
+## 3.2 Responsibilities
+
+- **Hook registration and deregistration** (keyboard + mouse) using pynput on both platforms (primary choice) or evdev on Linux if pynput is unavailable.
+
+- **Synthetic mouse event injection:** left click, right click, double click, button press, button release.
+
+- **Mouse position query:** Get current cursor coordinates.
+
+- **Keyboard event injection:** For simulated key presses (not used in v1.0 but provided for future features).
+
+- **Always-on-top window flag** for the break popup (platform-specific window manager hints).
+
+- **Monitor geometry query:** To center the popup on the correct screen.
+
+- **Input blocking:** Suppress keyboard and mouse events system-wide while the break popup is active.
+
+> **Implementation note:** System-wide input blocking is the most platform-sensitive requirement. On Windows, use a low-level hook (WH_KEYBOARD_LL / WH_MOUSE_LL via pywin32) that returns non-zero to suppress events. On Linux with X11, use XGrabKeyboard / XGrabPointer via python-xlib (see §12.1 for implementation spike). Wayland support is out of scope for v1.0. X11 only in v1.0. Document Wayland as a known limitation.
+
+## 3.3 API Surface
+
+All functions raise `OSAbstractionError` on failure. Each function logs the underlying platform-specific error to error.log before raising.
+
+### Input Monitoring
+- `install_keyboard_hook(callback)` — Returns hook handle or raises error
+- `install_mouse_hook(callback)` — Returns hook handle or raises error
+- `uninstall_hook(handle)` — Idempotent; no-op if handle already released
+
+### Mouse Control
+- `get_mouse_position()` — Returns (x, y) tuple
+- `inject_mouse_click(button='left'|'right')` — Injects single click at current position
+- `inject_mouse_double_click()` — Injects double-click at current position
+- `inject_mouse_button_down()` — Holds left button (for drag-drop)
+- `inject_mouse_button_up()` — Releases left button
+
+### Input Blocking
+- `block_input()` — Suppresses all keyboard keys and mouse clicks system-wide
+- `unblock_input()` — Restores normal input handling
+- Blocking is stateful: calling `block_input()` twice is safe (no-op on second call)
+
+### Display / Window Management
+- `get_monitor_geometry(monitor_spec)` — Returns (x, y, width, height) for specified monitor
+  - `monitor_spec` can be 'primary', 0 (primary), or 1, 2, 3... for additional monitors
+  - Returns primary monitor geometry if index is out of range (with WARNING logged)
+- `set_window_always_on_top(window_handle)` — Platform-specific always-on-top flag
+
+---
+
+# 4 Module: input_monitor
+
+## 4.1 Purpose
+
+Installs low-level keyboard and mouse hooks and publishes raw activity events to the internal event bus. All other modules consume these events; they do not install hooks themselves.
+
+## 4.2 Events Published
+
+All events include a `timestamp` (ISO-8601) and a `synthetic` flag (True if injected by auto_clicker or key_remapper, False otherwise).
+
+- **keyboard_activity** — Any key pressed or released
+  - Fields: `timestamp`, `key`, `event_type` (press|release), `synthetic`
+
+- **mouse_move** — Mouse position changed beyond the stillness threshold
+  - Fields: `timestamp`, `x`, `y`, `synthetic`
+
+- **mouse_click** — Any mouse button pressed
+  - Fields: `timestamp`, `button` (left|right|middle), `synthetic`
+
+- **mouse_scroll** — Scroll wheel moved (treated as mouse activity)
+  - Fields: `timestamp`, `direction` (up|down), `synthetic`
+
+## 4.3 Simulated vs. Real Events
+
+Events injected by auto_clicker or key_remapper must be tagged as simulated. Simulated events are passed to the event bus with a `synthetic=True` flag. Consumers that update the activity timer (activity_logger, break_enforcer) **must ignore** events where `synthetic=True` to avoid feedback loops.
+
+The key presses that trigger remapped mouse actions (F6–F9) count as keyboard activity for the activity timer and the activity log (because the physical key press is real, even though the resulting mouse action is synthetic).
+
+---
+
+# 5 Module: activity_logger
+
+## 5.1 Purpose
+
+Maintains per-minute activity state in memory and writes it to a daily CSV file. Manages log file lifecycle (rotation, deletion of old files).
+
+## 5.2 Log File Location and Naming
+
+- If **logFilePath** is empty or unset, log files are saved in the same folder as the executable.
+
+- If logFilePath is set to a valid absolute path, log files are saved there.
+
+- If logFilePath is set but the path does not exist or is not writable, fall back to the executable folder and write a WARNING to error.log: "logFilePath 'X' not accessible, using executable directory".
+
+- **File name format:** YYYY-MM-DD.csv (ISO 8601 date, based on logTimezone).
+
+## 5.3 CSV Format Specification
+
+Each CSV file has a header row followed by one data row per loggable minute or break event.
+
+**Encoding:** UTF-8 with BOM (for Excel compatibility)
+
+**Columns:**
+
+| **Column**  | **Example**            | **Description**                                                                                               |
+|-------------|------------------------|---------------------------------------------------------------------------------------------------------------|
+| timestamp   | 2025-06-01 14:32:00    | Start of the minute (YYYY-MM-DD HH:MM:SS) in logTimezone. For break events, the exact event timestamp.       |
+| activity    | keyboard&mouse         | One of: `keyboard` \| `mouse` \| `keyboard&mouse` \| `break_shown` \| `break_delayed` \| `break_ignored` \| `break_expired` |
+| detail      | *(empty or text)*      | Optional extra info. Used for break events (e.g., "countdown_elapsed", "delay_10min", "user_ignored").       |
+
+**Header row (first line of every CSV):**
+```
+timestamp,activity,detail
+```
+
+**Example rows:**
+```
+2025-06-01 14:32:00,keyboard&mouse,
+2025-06-01 14:33:00,mouse,
+2025-06-01 15:15:42,break_shown,countdown_started
+2025-06-01 15:18:42,break_expired,countdown_elapsed
+2025-06-01 16:45:30,break_delayed,delay_10min
+```
+
+> **Implementation note:** Only minutes where activity actually occurred are written. Minutes of complete inactivity produce no row. Break events are written with their exact timestamp (not rounded to the minute). All timestamps use the timezone specified in logTimezone.
+
+## 5.4 Per-Minute Tracking Logic
+
+- A background thread ticks every second and checks the in-memory activity flags for the current minute.
+
+- If any non-synthetic keyboard event was received in the current minute, the `keyboard` flag is set.
+
+- If any non-synthetic mouse event (move, click, scroll) was received in the current minute, the `mouse` flag is set.
+
+- At the turn of each minute (HH:MM:00):
+  1. If either flag is set, determine the activity value: `keyboard`, `mouse`, or `keyboard&mouse`
+  2. Write a CSV row: `<timestamp>,<activity>,` (detail column empty for activity rows)
+  3. Reset both flags
+
+- The timestamp written to the CSV is the exact start of the minute being logged (HH:MM:00), not the time the row was written.
+
+## 5.5 Log File Maintenance
+
+- On startup (after config is loaded), scan the log directory for CSV files matching the name pattern YYYY-MM-DD.csv.
+
+- Delete any file whose date is older than **logMaintainDays** calendar days from today.
+
+- Repeat this scan once per day at midnight (00:00 local time) using a scheduled background task.
+
+- If a file cannot be deleted (permission error), log a WARNING and skip it.
+
+---
+
+# 6 Module: break_enforcer
+
+## 6.1 Purpose
+
+Tracks continuous activity and continuous rest durations. Triggers the break popup when the activity threshold is exceeded. Coordinates with os_abstraction to block/unblock input during the popup.
+
+## 6.2 Timer Definitions
+
+- **Activity timer:** Counts elapsed minutes during which the user was continuously active (keyboard or mouse used at least once per minute). Measured in whole minutes, updated every 60 seconds.
+
+- **Rest detector:** If the user is inactive (no keyboard or mouse events) for a **continuous** duration of **pauseTimerRestInMinutes** minutes, the activity timer resets to zero.
+
+> **Clarification on rest:** Rest must be continuous. Example: pauseTimerRestInMinutes = 5. If the user rests 4 minutes, types for 30 seconds, then rests again — the rest counter resets on the first keystroke. Only an uninterrupted 5-minute silence resets the activity timer. The rest detector is driven by the same 1-second background tick used by activity_logger; resolution is therefore 1 second. The rest counter resets to zero on any non-synthetic keyboard or mouse event.
+
+## 6.3 Popup Trigger
+
+- When the activity timer reaches **pauseTimerInMinutes**, the break popup is displayed immediately (see break_popup module).
+
+- Input blocking is activated the moment the popup appears: all keyboard key presses and mouse button clicks are suppressed system-wide. Mouse movement and scroll are **not** blocked (the cursor can move freely).
+
+- The activity timer is **paused** (not reset) while the popup is visible.
+
+## 6.4 Popup Outcomes
+
+The popup offers three paths to dismissal:
+
+| **Outcome**                     | **Behavior**                                                                                                                                                                                                                                                                       |
+|---------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Countdown expires (3 min)**   | Popup closes. Input unblocked. Activity timer **resets to zero** and restarts. Log entry: `break_expired,countdown_elapsed`                                                                                                                                                        |
+| **User clicks 'Ignore'**        | Popup closes. Input unblocked. Activity timer **resets to zero** and restarts. Log entry: `break_ignored,user_ignored`                                                                                                                                                             |
+| **User clicks 'Delay'**         | Popup closes. Input unblocked. A delay timer of **breakDelayMinutes** (default: 10) starts. The activity timer is **paused** (not reset) during the delay period. When the delay timer expires, the popup is shown again and input is blocked again. Log entry: `break_delayed,delay_Xmin` where X is the configured delay value. |
+
+> **Clarification:** Clicking 'Delay' multiple times in succession is allowed — each click resets the delay timer to breakDelayMinutes. The activity timer is paused (not reset) during a delay period. Only a countdown expiry or an 'Ignore' click resets the activity timer. The activity timer does not accumulate time during the delay period; it resumes from the same value it had when the popup was first shown.
+
+## 6.5 Input Blocking Scope
+
+- **Blocked while popup is visible:** All keyboard key presses, all mouse button clicks (left, right, middle, extra buttons).
+
+- **Not blocked:** Mouse cursor movement, mouse scroll wheel.
+
+- **Popup interaction:** The popup buttons ('Delay' and 'Ignore') themselves must work — the block is applied to all other windows/applications but not to the popup window itself. This is achieved by the popup consuming its own events before the block hook sees them.
+
+- **Remapped keys and auto-click toggle:** The remapped keys (F6–F9) and the auto-click toggle (F10) are also blocked while the popup is visible.
+
+- **Delay period behavior:** If the user has 'Delay' active (delay countdown running) and then resumes working, the activity timer remains frozen during the entire delay period. It only resumes (from where it paused) after the delay popup is dismissed (via 'Ignore', 'Delay' again, or countdown expiry).
+
+---
+
+# 7 Module: break_popup
+
+## 7.1 Purpose
+
+Displays a small always-on-top GUI window when a break is required. This is the only graphical window in ergoProtect.
+
+## 7.2 Implementation
+
+- Built with **tkinter** (standard library — no extra dependencies).
+
+- The window is **always-on-top** across all applications (uses platform-specific window hints via os_abstraction).
+
+- **Monitor targeting:** Centered on the monitor specified by **breakPopupMonitor** (default: primary monitor).
+
+- **Window size:** Approximately 360 × 200 pixels. No title bar buttons (no minimize, maximize, close). The window cannot be moved or resized by the user.
+
+- **Window style:** Frameless (no OS title bar), custom rounded corners (optional, platform-dependent).
+
+## 7.3 Contents
+
+- **Heading:** "Time for a break!" (bold, large font ~18pt)
+
+- **Countdown timer:** Displayed prominently below the heading, counting down from **breakCountdownSeconds** (default 180) in MM:SS format (e.g., "03:00", "02:59", ...). Font size ~24pt, monospace.
+
+- **Progress bar:** Visual progress bar showing countdown progress (e.g., tkinter.ttk.Progressbar), synchronized with the numeric timer.
+
+- **Button: 'Delay N min'** — Where N is the current value of breakDelayMinutes. Closes popup, starts delay timer (see break_enforcer). The label is generated at popup creation time from the config value so it always reflects the actual configured delay (e.g., "Delay 10 min").
+
+- **Button: 'Ignore'** — Closes popup, resets activity timer.
+
+- **Informational text:** Below the buttons: "Look away from the screen and relax. Keyboard and mouse are temporarily disabled." (small font ~10pt, gray color)
+
+- **No sound:** The popup does not play any sound when it appears (to avoid disturbing the user or others nearby).
+
+## 7.4 Visual Design
+
+- **Background color:** Light neutral (e.g., #F5F5F5)
+- **Text color:** Dark gray (e.g., #333333)
+- **Button style:** Rounded, with distinct hover states
+- **Layout:** Vertical stack: heading → timer → progress bar → buttons (horizontal row) → info text
+
+---
+
+# 8 Module: auto_clicker
+
+## 8.1 Purpose
+
+When enabled, watches for mouse stillness and automatically fires a left click after a configurable delay. Useful for accessibility or repetitive-click workflows.
+
+## 8.2 Toggle
+
+- The feature is toggled on/off by pressing the key specified in **activateDeactivateAutoClick** (default: F10).
+
+- The feature starts **disabled** on daemon launch.
+
+- Each toggle key press flips the state (on → off → on → ...).
+
+- No visual indicator is shown when toggling (headless operation). The status command (§2.10) reports the current auto-clicker state.
+
+## 8.3 Click Logic
+
+- **Mouse 'still' definition:** No movement greater than **autoClickMovementThresholdPx** pixels from the last recorded position for **autoClickDelayInMs** milliseconds.
+
+- **When stillness is detected:** Inject a synthetic left mouse click at the current cursor position.
+
+- **After clicking:** The stillness timer resets. Another click will not fire until the mouse moves (beyond the threshold) and stops again.
+
+- **Suppression conditions (do not fire auto-click if):**
+  - The break popup is active (input blocked)
+  - The user is currently in drag-drop mode (left button held by key_remapper)
+  - Auto-clicker is toggled off
+
+- The injected click is tagged `synthetic=True` and does **not** count as user activity for the activity timer or activity log.
+
+---
+
+# 9 Module: key_remapper
+
+## 9.1 Purpose
+
+Maps configurable keyboard keys to mouse button actions. All four actions work independently of whether auto_clicker is enabled.
+
+## 9.2 Key Actions
+
+| **Config key**            | **Default key** | **Action**                                                           |
+|---------------------------|-----------------|----------------------------------------------------------------------|
+| leftMouseClickKey         | F9              | Inject a single left mouse click at current cursor position.         |
+| rightMouseClickKey        | F8              | Inject a single right mouse click at current cursor position.        |
+| leftMouseDoubleClickKey   | F7              | Inject a left mouse double-click at current cursor position.         |
+| leftMouseDragDropKey      | F6              | Toggle drag-drop mode (see below).                                   |
+
+All injected mouse events are tagged `synthetic=True`.
+
+## 9.3 Drag-Drop Mode
+
+- **First press** of leftMouseDragDropKey: Inject a mouse button-down event (left button held). The cursor can now be moved and the system behaves as if the left button is physically held.
+
+- **Second press** of leftMouseDragDropKey: Inject a mouse button-up event (left button released). Drag-drop mode ends.
+
+- **Early cancellation:** If the left mouse button is already down (drag-drop mode active) and the user presses **any** physical mouse button, cancel the drag-drop action immediately by injecting a mouse button-up event. This prevents conflicts with real mouse usage.
+
+- **Auto-release triggers** (button-up injected immediately, drag-drop mode cancelled):
+  1. Daemon shutdown or restart
+  2. Break popup appears
+  3. OS session lock detected (deferred to v1.1, see §12.2)
+  4. Any unhandled exception in key_remapper module
+
+- **Interaction guards:**
+  - While in drag-drop mode, leftMouseClickKey and leftMouseDoubleClickKey presses are **ignored** (no action taken) to prevent conflicting injection.
+  - If leftMouseDragDropKey is pressed while the break popup is active (input blocked), the press is silently ignored (no state change, no injection).
+
+## 9.4 Interaction Guard Rules
+
+- All four remap keys (F6–F9) are fully suppressed while the break popup is active — the underlying key event is consumed and the action is not performed.
+
+- The auto-click toggle key (F10) is also suppressed while the popup is active.
+
+- All injected mouse events are tagged `synthetic=True`.
+
+---
+
+# 10 Installation and Packaging
+
+## 10.1 Windows
+
+### Two-Process Architecture
+
+ergoProtect uses a two-process design on Windows to separate the background service logic from GUI responsibilities:
+
+- **Worker process (ergoprotect-worker.exe):** Registered as a Windows Service via pywin32 (win32serviceutil). Runs as the logged-in user. Responsible for all hook registration, activity tracking, timer logic, and log writing. When a break is due, it sends a `SHOW_POPUP` command over a named pipe to the tray process. It receives `POPUP_RESULT` (expired | ignored | delayed) back from the tray process to update its state.
+
+- **Tray process (ergoprotect-tray.exe):** Launched at user logon via the Windows startup folder (or Task Scheduler logon trigger). Runs entirely in the user session. Manages the system tray icon, displays the break popup window (tkinter), and relays popup outcome to the worker via the named pipe. If the worker is not running, the tray process waits and retries connection on a 5-second interval.
+
+### Inter-Process Communication
+
+- **Named pipe:** `\\.\pipe\ergoProtect`
+- **Protocol:** Simple text-based command protocol
+  - Worker → Tray: `SHOW_POPUP`
+  - Tray → Worker: `POPUP_RESULT:expired` | `POPUP_RESULT:ignored` | `POPUP_RESULT:delayed`
+- **Security:** Pipe created with DACL allowing only the current user (not SYSTEM or other users)
+
+### Installation
+
+- **Package as:** Single-folder distribution with ergoprotect-worker.exe and ergoprotect-tray.exe using PyInstaller.
+
+- **Install script:** `ergoprotect-worker.exe --install` performs the following:
+  1. Registers the worker as a Windows Service (auto-start, logged-in user)
+  2. Copies ergoprotect-tray.exe shortcut to the current user's Startup folder
+  3. Launches the tray process immediately (no reboot required)
+  4. Creates a default config.ini if none exists
+
+- **Uninstall script:** `ergoprotect-worker.exe --uninstall` reverses all steps:
+  1. Stops the worker service
+  2. Unregisters the service
+  3. Removes the Startup folder shortcut
+  4. Terminates the tray process if running
+  5. Does NOT delete config.ini, log files, or error.log (user data preserved)
+
+## 10.2 Linux
+
+### Single-Process Architecture
+
+- **Package as:** Single binary `ergoprotect` using PyInstaller.
+
+- **Service type:** systemd user unit (not system unit) to access the display session.
+
+- **GUI/Tray (optional):** On Linux, the tray GUI is optional. If needed for desktop integration, it can be launched as a separate thread within the same process. For v1.0, focus on headless operation; tray GUI is deferred to v1.1.
+
+### Installation
+
+- **Provide:** `ergoprotect.service` (systemd user unit file) in the distribution.
+
+- **install.sh script:**
+  ```bash
+  #!/bin/bash
+  # Copy binary to user's local bin
+  mkdir -p ~/.local/bin
+  cp ergoprotect ~/.local/bin/
+  chmod +x ~/.local/bin/ergoprotect
+  
+  # Install systemd user unit
+  mkdir -p ~/.config/systemd/user
+  cp ergoprotect.service ~/.config/systemd/user/
+  
+  # Reload and enable
+  systemctl --user daemon-reload
+  systemctl --user enable ergoprotect
+  systemctl --user start ergoprotect
+  
+  echo "ergoProtect installed and started."
+  echo "Check status: systemctl --user status ergoprotect"
+  ```
+
+- **User group requirement:** The README must document: `sudo usermod -aG input $USER` (required for evdev access on some distributions). User must log out and back in for group change to take effect.
+
+## 10.3 File Layout (both platforms)
+
+| **File**                    | **Purpose**                                                                 |
+|-----------------------------|-----------------------------------------------------------------------------|
+| ergoprotect-worker[.exe]    | Background worker — Windows Service / Linux daemon                          |
+| ergoprotect-tray.exe        | Tray/GUI process — Windows only (auto-started at logon)                     |
+| config.ini                  | Configuration (created with defaults on first run if absent)                |
+| YYYY-MM-DD.csv              | Daily activity log (auto-created)                                           |
+| error.log                   | Error and warning log (auto-created)                                        |
+| ergoprotect.pid             | PID file — Linux only (auto-created, auto-deleted)                          |
+
+---
+
+# 11 Dependencies
+
+## 11.1 Python Packages
+
+All packages must be bundled in the PyInstaller executable. Minimum versions listed below:
+
+| **Package**     | **Minimum Version** | **Purpose**                                      | **Platform** |
+|-----------------|---------------------|--------------------------------------------------|--------------|
+| pynput          | 1.7.6               | Keyboard and mouse hooks                         | Both         |
+| pywin32         | 305                 | Windows Service, low-level hooks, named pipes    | Windows      |
+| python-xlib     | 0.33                | X11 input blocking (XGrab)                       | Linux        |
+| evdev           | 1.6.0               | Fallback input hooks on Linux (if pynput fails)  | Linux        |
+| tkinter         | (stdlib)            | Break popup GUI                                  | Both         |
+| configparser    | (stdlib)            | INI file parsing                                 | Both         |
+| zoneinfo        | (stdlib, 3.9+)      | Timezone handling                                | Both         |
+
+## 11.2 System Dependencies (Linux)
+
+- **X11 libraries:** libx11-dev (for python-xlib)
+- **Tkinter:** python3-tk (separate package on Debian/Ubuntu)
+- **Input group:** User must be in `input` group for evdev
+
+The install.sh script or README must guide the user to install these if missing.
+
+---
+
+# 12 Security and Privacy
+
+## 12.1 Named Pipe Security (Windows)
+
+The named pipe `\\.\pipe\ergoProtect` must be created with a DACL (Discretionary Access Control List) that allows access only to the current user. This prevents other users or SYSTEM from sending spoofed commands to the tray process.
+
+**Implementation:** Use `win32pipe.CreateNamedPipe` with `PIPE_ACCESS_DUPLEX` and a security descriptor restricting access to the current user SID.
+
+## 12.2 File Permissions
+
+- **config.ini:** Readable and writable only by the owner (chmod 600 on Linux, NTFS ACL on Windows).
+- **error.log, CSV files:** Readable and writable only by the owner.
+- **PID file (Linux):** Readable and writable only by the owner.
+
+On first creation, set permissions explicitly. Do not rely on umask defaults.
+
+## 12.3 Privacy Considerations
+
+- **Activity logging:** CSV files contain only per-minute activity flags (keyboard/mouse), not keystrokes or specific applications. No personally identifiable information (PII) is logged.
+
+- **No network activity:** ergoProtect does not make any network connections. All data stays local.
+
+- **No telemetry:** No usage statistics or crash reports are sent to any server.
+
+## 12.4 Input Injection Safety
+
+- Synthetic events are used only for the user's configured accessibility features (auto-click, key remapping). They are never triggered by external input or network commands.
+
+- The daemon validates all configuration values to prevent injection attacks via config.ini tampering (e.g., invalid key names, out-of-range numeric values).
+
+---
+
+# 13 Testing Requirements
+
+## 13.1 Unit Tests
+
+Each module must have unit tests covering:
+
+- Configuration loading and validation (valid, invalid, missing values)
+- Event bus publish/subscribe (overflow, ordering, thread safety)
+- Activity timer logic (rest detection, pause/resume)
+- CSV writing and log rotation
+- Drag-drop mode state transitions and auto-release
+
+**Test framework:** pytest
+
+**Coverage target:** 80% line coverage minimum
+
+## 13.2 Integration Tests
+
+- End-to-end startup and shutdown sequence
+- Break popup trigger and dismissal (all three outcomes)
+- Input blocking and unblocking (verify events are suppressed)
+- Log file creation and daily rotation
+- Platform-specific: PID file / mutex enforcement (single instance)
+
+## 13.3 Manual Test Scenarios
+
+Before each release, manually test the following on both platforms:
+
+1. **First run:** No config.ini exists → default config created, daemon starts successfully.
+2. **Invalid config:** Set invalid values in config.ini → daemon uses defaults, warnings logged.
+3. **Key binding conflict:** Assign same key to two functions → daemon refuses to start with clear error.
+4. **Break popup:** Trigger break → verify input is blocked, buttons work, countdown expires correctly.
+5. **Auto-click:** Enable with F10 → verify click fires after stillness, disabled during break.
+6. **Drag-drop:** Press F6 → move mouse → press F6 again → verify drag works, auto-release on shutdown.
+7. **Log maintenance:** Set logMaintainDays=1, create old CSV files → verify they are deleted on startup.
+8. **Multi-monitor:** If available, test breakPopupMonitor with different indices.
+
+---
+
+# 14 Installation and Upgrade
+
+## 14.1 Fresh Installation
+
+See §10 for platform-specific install procedures.
+
+## 14.2 Upgrade from v1.0 to v1.1 (or later)
+
+1. **Stop the daemon/service:**
+   - Windows: `ergoprotect-worker.exe --stop` or `net stop ergoProtect`
+   - Linux: `systemctl --user stop ergoprotect`
+
+2. **Replace executables:**
+   - Windows: Replace ergoprotect-worker.exe and ergoprotect-tray.exe in the installation directory.
+   - Linux: Replace the ergoprotect binary in ~/.local/bin/ (or wherever installed).
+
+3. **Preserve user data:**
+   - Do NOT delete config.ini, error.log, or CSV files.
+   - The new version will automatically migrate config.ini if needed (see §12.4 in To-Do for v1.1 config version field).
+
+4. **Restart the daemon/service:**
+   - Windows: `ergoprotect-worker.exe --start` or `net start ergoProtect`
+   - Linux: `systemctl --user start ergoprotect`
+
+5. **Verify upgrade:**
+   - Run `ergoprotect status` (or `ergoprotect-worker.exe status` on Windows) to confirm the new version is running.
+   - Check error.log for any migration warnings or errors.
+
+## 14.3 Uninstallation
+
+- **Windows:** Run `ergoprotect-worker.exe --uninstall` (see §10.1).
+- **Linux:** Run `systemctl --user stop ergoprotect && systemctl --user disable ergoprotect`, then delete ~/.local/bin/ergoprotect and ~/.config/systemd/user/ergoprotect.service.
+- User data (config.ini, logs) is NOT automatically deleted. User must manually delete the installation folder if desired.
+
+---
+
+# 15 Documentation Deliverables
+
+## 15.1 Changelog.md
+
+A file named "changeLog.md" in markdown format containing version history.
+
+**Version format:** `<major>.<minor>.<bugfix>` (semantic versioning)
+
+**First version:** 1.0.0
+
+**Example structure:**
+```markdown
+# Changelog
+
+## [1.1.0] - 2025-07-15
+### Added
+- Config version field for forward compatibility
+- Log file size cap (10 MB with rotation)
+
+### Fixed
+- Input blocking race condition on Linux X11
+
+## [1.0.0] - 2025-06-01
+### Added
+- Initial release
+- Activity logging to daily CSV files
+- Timed break reminders with popup
+- Auto-click feature (F10 toggle)
+- Keyboard-to-mouse key remapping (F6-F9)
+```
+
+## 15.2 howToBuildExecutables.md
+
+A file named "howToBuildExecutables.md" in markdown format containing build instructions.
+
+### Windows 10 & 11
+
+- How to install Python 3.10+ and pip
+- How to install dependencies: `pip install -r requirements.txt`
+- How to build ergoprotect-worker.exe:
+  ```bash
+  pyinstaller --onefile --noconsole --name ergoprotect-worker worker_main.py
+  ```
+- How to build ergoprotect-tray.exe:
+  ```bash
+  pyinstaller --onefile --noconsole --name ergoprotect-tray tray_main.py
+  ```
+
+### Linux (Debian distros)
+
+- How to install Python 3.10+ and pip
+- How to install system dependencies:
+  ```bash
+  sudo apt-get install python3-tk libx11-dev
+  ```
+- How to install Python dependencies: `pip install -r requirements.txt`
+- How to build ergoprotect binary:
+  ```bash
+  pyinstaller --onefile --name ergoprotect daemon_main.py
+  ```
+
+## 15.3 README.md
+
+A file named "readme.md" in markdown format containing:
+
+### Basic App Description
+
+ergoProtect is a background daemon/service that monitors keyboard and mouse usage to encourage healthy work habits through timed break reminders and activity logging.
+
+### Legal Notice
+
+```
+MIT License (or similar open-source license)
+
+NO WARRANTY: This software is provided "as is" without warranty of any kind.
+LIMITATION OF LIABILITY: The authors are not liable for any damages arising from use of this software.
+FREE TO USE: This software is free and open-source.
+```
+
+### Quick Start — Windows
+
+1. **Prerequisites:** Windows 10 or 11, no admin rights required.
+
+2. **Installation:**
+   - Extract the distribution ZIP to a folder of your choice (e.g., `C:\ergoProtect`).
+   - Both `ergoprotect-worker.exe` and `ergoprotect-tray.exe` must be in the same folder.
+   - (Optional) Place a `config.ini` file in the same folder. If missing, defaults will be used.
+
+3. **Install the service:**
+   ```cmd
+   cd C:\ergoProtect
+   ergoprotect-worker.exe --install
+   ```
+   This command:
+   - Registers the worker as a Windows Service
+   - Adds the tray app to your Startup folder
+   - Starts both processes immediately
+
+4. **Verify installation:**
+   ```cmd
+   ergoprotect-worker.exe status
+   ```
+   Should show: "ergoProtect status: RUNNING"
+
+5. **Uninstall:**
+   ```cmd
+   ergoprotect-worker.exe --uninstall
+   ```
+
+### Quick Start — Linux
+
+1. **Prerequisites:** Debian-based distro (Ubuntu, Mint, etc.), Python 3.10+, X11 (Wayland unsupported in v1.0).
+
+2. **Installation:**
+   - Extract the distribution tarball to a folder of your choice.
+   - Run the install script:
+     ```bash
+     cd ergoprotect-1.0.0
+     chmod +x install.sh
+     ./install.sh
+     ```
+   - If you encounter permission errors, add your user to the `input` group:
+     ```bash
+     sudo usermod -aG input $USER
+     ```
+     Then log out and back in.
+
+3. **Verify installation:**
+   ```bash
+   systemctl --user status ergoprotect
+   ```
+   Should show: "active (running)"
+
+4. **Uninstall:**
+   ```bash
+   systemctl --user stop ergoprotect
+   systemctl --user disable ergoprotect
+   rm ~/.local/bin/ergoprotect
+   rm ~/.config/systemd/user/ergoprotect.service
+   ```
+
+### Configuration
+
+Edit `config.ini` in the installation folder to customize behavior. Restart the service after changes.
+
+See the full parameter table in the SRS document (§2.6) or the commented default config.ini for details.
+
+---
+
+# 16 To-Do / Open Items
+
+The following items require a spike, test, or architectural decision before the relevant code can be finalized. They are listed here so they are not forgotten during implementation.
+
+## 16.1 Linux input blocking + pynput coexistence (spike required)
+
+**Issue:** The input blocking mechanism on Linux (X11 XGrabKeyboard / XGrabPointer via python-xlib) and the pynput keyboard/mouse listener both operate on the X display connection. An XGrab call gives the grabbing client exclusive access to input, which may prevent pynput's listener from receiving events during the grab period. If pynput's listener goes silent during the break popup, the synthetic=True event filter and the break_popup button callbacks could both fail.
+
+**Action required:** Write a minimal test program on X11 that (a) installs a pynput listener, (b) XGrabs keyboard and pointer from a separate thread, (c) verifies whether pynput still receives events during the grab. Based on the result, choose one of the following approaches:
+
+1. Perform the XGrab from the same Xlib connection that pynput uses internally (requires patching pynput or using its internal display object).
+2. Use a WM_TAKE_FOCUS / input-only window approach for blocking instead of XGrab.
+3. Move event suppression entirely into the pynput callback (return False to suppress instead of using XGrab).
+
+This spike must be completed before implementing `os_abstraction.block_input()` on Linux.
+
+**Affects:** os_abstraction (§3), break_enforcer (§6.5).
+
+## 16.2 OS session lock detection (deferred to v1.1)
+
+**Issue:** §9.3 lists "OS session lock detected" as an auto-release trigger for drag-drop mode. The implementation mechanism is not yet defined and differs per platform.
+
+**Deferred to v1.1.** For v1.0, daemon shutdown and unhandled exceptions already cover the crash/exit path. The practical impact of missing session-lock detection is limited to the case where the user locks the screen while drag-drop mode is active — the button-up event will be injected at next daemon stop or unlock.
+
+**Implementation notes for v1.1:**
+
+- **Windows:** Subscribe to `WTSRegisterSessionNotification` (pywin32) in the worker process to receive `WM_WTSSESSION_CHANGE` with `WTS_SESSION_LOCK`.
+- **Linux:** Subscribe to the `PrepareForSleep` or `Lock` signal on the `org.freedesktop.login1.Session` D-Bus interface (via dasbus or dbus-python).
+
+**Affects:** key_remapper (§9.3), os_abstraction (§3).
+
+## 16.3 error.log growth limit (deferred to v1.1)
+
+**Issue:** §2.7 defers log rotation for v1.0. For long-running deployments, error.log could grow without bound.
+
+**Action for v1.1:** Implement a simple size-based cap: if error.log exceeds 10 MB on startup, rename it to error.log.old and start a fresh file. Only one backup file is kept.
+
+**No immediate action required for v1.0.**
+
+## 16.4 config.ini version field (deferred to v1.1)
+
+**Issue:** The current fallback behavior (missing keys use defaults silently) handles forward compatibility adequately for v1.0.
+
+**Action for v1.1:** Add a `configVersion = 1` key to config.ini. On startup, if the key is absent or lower than the current expected version, log an INFO message indicating that defaults were applied for any new keys. No migration scripts needed — the silent-default rule covers it.
+
+## 16.5 tkinter availability on minimal Linux installs (packaging note)
+
+**Issue:** tkinter is part of the Python standard library but is a separate optional package on some Linux distributions (e.g., python3-tk on Debian/Ubuntu). PyInstaller must be tested to confirm it correctly bundles tkinter and its Tcl/Tk dependency.
+
+**Action:** The README and install.sh must document the fallback: if the packaged binary fails to show the popup, the user should run `sudo apt-get install python3-tk` (or equivalent) and report the issue. Verify this during the first Linux packaging run.
+
+**Affects:** break_popup (§7), installation docs (§15.3).
+
+---
+
+# Appendix A: Sample config.ini
+
+```ini
+# ergoProtect Configuration File
+# Version: 1.0
+# All parameters are optional. If omitted, defaults are used.
+
+# Key bindings for mouse actions (F1-F12, A-Z, 0-9 supported)
+leftMouseClickKey = F9
+rightMouseClickKey = F8
+leftMouseDoubleClickKey = F7
+leftMouseDragDropKey = F6
+activateDeactivateAutoClick = F10
+
+# Auto-click settings
+autoClickDelayInMs = 200
+autoClickMovementThresholdPx = 3
+
+# Break reminder settings
+pauseTimerInMinutes = 40
+pauseTimerRestInMinutes = 5
+breakCountdownSeconds = 180
+breakDelayMinutes = 10
+
+# Logging settings
+logMaintainDays = 30
+logFilePath = 
+logTimezone = local
+
+# Display settings
+breakPopupMonitor = primary
+```
+
+---
+
+# Appendix B: Sample CSV Output
+
+**Filename:** 2025-06-01.csv
+
+```csv
+timestamp,activity,detail
+2025-06-01 09:15:00,keyboard&mouse,
+2025-06-01 09:16:00,keyboard,
+2025-06-01 09:17:00,mouse,
+2025-06-01 09:55:42,break_shown,countdown_started
+2025-06-01 09:58:42,break_expired,countdown_elapsed
+2025-06-01 10:30:00,keyboard&mouse,
+2025-06-01 11:10:15,break_delayed,delay_10min
+2025-06-01 14:25:30,break_ignored,user_ignored
+```
+
+---
+
+# Appendix C: Error Code Reference
+
+| **Error Code** | **Message**                                             | **Severity** | **Action**                                                   |
+|----------------|---------------------------------------------------------|--------------|--------------------------------------------------------------|
+| E001           | ergoProtect is already running (PID: XXXX)              | ERROR        | Another instance detected. Stop it first or delete stale PID file. |
+| E002           | Configuration error: Key 'X' assigned to multiple functions | ERROR    | Fix config.ini to assign unique keys to each function.       |
+| E003           | Failed to register keyboard hook: PermissionError       | ERROR        | User lacks permissions. Add to 'input' group (Linux) or run as user (Windows). |
+| E004           | logFilePath 'X' not accessible, using executable directory | WARNING   | Check path exists and is writable.                           |
+| E005           | Invalid timezone 'X', falling back to 'local'           | WARNING      | Use a valid tz database name or 'local'.                     |
+| E006           | Monitor index X exceeds available monitors, using primary | WARNING   | Reduce index or use 'primary'.                               |
+
+---
+
+*End of document — ergoProtect SRS v1.1 (rev. 2)*
