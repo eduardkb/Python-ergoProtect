@@ -65,7 +65,10 @@ try:
 except ImportError:
     _DEPS_AVAILABLE = False
 
-from src.AppLogging import log_info, log_warning, log_error, log_debug
+try:
+    from src.AppLogging import log_info, log_warning, log_error, log_debug
+except ImportError:
+    from AppLogging import log_info, log_warning, log_error, log_debug
 
 # Module identifier used in all log calls.
 _MOD = "KeyboardActions"

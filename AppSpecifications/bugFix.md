@@ -43,5 +43,5 @@ After completing the changes, generate a new `.zip` file containing the updated 
 ## Bug Fix Instructions
     
 ==========================================
-- when application is run with "python main.py" on command line, the tab "Keyboard Actions" is built and initialized. But when a .exe is generated with pyinstaller, it still just displays "Module not present". also, sometimes different icons are used for tray icon, .exe icon and graphical interface icon. make sure all 3 places have same icon. preferably the icon inside assets folder named icon.ico. just generate a icon if the file on this folder is not readable or not an .ico file. if this happens, use the generated icon everywhere.
+- when application is run with "python main.py" on command line, the tab "Keyboard Actions" is built and initialized. But when a .exe is generated with pyinstaller, it still just displays "Module not present".
 ==========================================
