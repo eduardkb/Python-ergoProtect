@@ -71,7 +71,7 @@ class GraphicalInterface:
       - Provide show() and hide() methods for the tray icon to call.
     """
 
-    def __init__(self, config_manager, icon_image=None) -> None:
+    def __init__(self, config_manager, icon_image=None, icon_path: str = None) -> None:
         """
         Build the window. Does NOT call mainloop() – that is the caller's
         responsibility (see main.py).
@@ -82,11 +82,15 @@ class GraphicalInterface:
             icon_image:     Optional PIL Image object (already loaded in main.py
                             for the tray icon). When provided it is also applied
                             to the window's title-bar icon, ensuring both the tray
-                            and the GUI show the same image. Falls back to loading
-                            assets/icon.ico directly if not provided.
+                            and the GUI show the same image.
+            icon_path:      Optional path to the .ico file on disk. When provided,
+                            used for iconbitmap() (Windows title bar / taskbar) so
+                            the GUI, tray, and .exe file icon all share the same
+                            source file. Falls back to assets/icon.ico if omitted.
         """
         self._cfg = config_manager
         self._icon_image = icon_image  # PIL Image or None
+        self._icon_path = icon_path    # str path to .ico or None
         self._root = tk.Tk()
         self._configure_window()
         self._build_tabs()
@@ -130,10 +134,15 @@ class GraphicalInterface:
 
         # Strategy 2: .ico file on disk (Windows iconbitmap)
         if not icon_set:
-            icon_path = os.path.join(
-                os.path.dirname(os.path.dirname(__file__)), "assets", "icon.ico"
-            )
-            if os.path.exists(icon_path):
+            # Use the icon_path passed in from main.py (which is always valid
+            # after _load_or_generate_icon runs). Fall back to a local search
+            # when GraphicalInterface is instantiated standalone (e.g. tests).
+            icon_path = self._icon_path
+            if not icon_path:
+                icon_path = os.path.join(
+                    os.path.dirname(os.path.dirname(__file__)), "assets", "icon.ico"
+                )
+            if icon_path and os.path.exists(icon_path):
                 try:
                     self._root.iconbitmap(icon_path)
                     icon_set = True
@@ -343,14 +352,31 @@ class GraphicalInterface:
     @staticmethod
     def _try_load_module(module_name: str):
         """
-        Attempt to import `src.<module_name>`.
+        Attempt to import the feature module.
 
-        Returns the module object on success, or None if import fails.
+        Import strategy (tried in order):
+          1. ``src.<module_name>``  — standard layout when running with
+             ``python main.py`` from the project root.
+          2. ``<module_name>``      — direct (flat) import used by PyInstaller
+             bundles, where all modules are packed into the top-level namespace
+             and the ``src`` sub-package no longer exists.
+
+        Returns the module object on success, or None if all strategies fail.
         Failures are expected and non-fatal (e.g. placeholder modules that
         haven't been written yet, or optional dependencies missing).
         """
+        # Strategy 1: src.<module_name> (normal Python execution)
         try:
             return importlib.import_module(f"src.{module_name}")
+        except ImportError:
+            pass
+        except Exception as exc:
+            log_error(_MOD, "Unexpected error importing src.%s: %s", module_name, exc, exc_info=True)
+            return None
+
+        # Strategy 2: <module_name> directly (PyInstaller bundle / flat layout)
+        try:
+            return importlib.import_module(module_name)
         except ImportError:
             return None
         except Exception as exc:

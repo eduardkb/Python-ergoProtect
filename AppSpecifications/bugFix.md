@@ -1,17 +1,47 @@
-Analyzing  existant files (.zip attached) make changes below to python code.
-As a result let me download a new zip file with the full code on changed files. 
-==========================================
-Instructions for bug fixes:
-    - config.Ini file should never be updated concurrently. Make each modue write it in a logical sequence. and implemnt a failsafe (queue to write or some good solution)
-    - if ergoProtect icon on tray is double clicked, it should show the app's graphical interface
-    - The mamin graphical interface is not showing any icon. Make it show the same icon that is displayed correclty already on the tray.
-    - Applications like MS Excel and VS Code and others are still doing actions on "keyboard press" keyboard shortcuts that belong to their own app. On all applications take over the application specific action and do only the action that should be done by the ergoProtect Application.
+## Task Overview
+Analyze the existing project files (provided as a `.zip`). Apply the required modifications described in the **“Instructions for Bug Fixes”** section to the Python code.
+
+After completing the changes, generate a new `.zip` file containing the updated code.
+
+---
+
+## Output Requirements
+- The final deliverable must be a `.zip` file.
+- This `.zip` must include **only the Python (`.py`) files that were modified**.
+- Each included file must contain its **full updated code**, not partial snippets.
+
+---
+
+## General Rules
+
+### 1. Modify Only What Is Necessary
+- Do not change files unless required by the bug fix instructions.
+- Do not refactor unrelated code.
+
+### 2. No New Files
+- Do not create new files.
+- Do not generate documentation or auxiliary files.
+
+### 3. Exclude Non-Code Files
+- Do not modify or include files such as `.md`, `README.md`, or any non-Python files.
+
+### 4. Threading Requirement
+- Each major feature or UI tab in the application must run in a **separate thread**.
+
+### 5. Dependencies Between Files
+- If a bug fix requires changes in multiple files, include all affected `.py` files in the output `.zip`.
+
+### 6. Ambiguity Handling
+- If any instruction is unclear or incomplete, implement the **most reasonable and robust solution**.
+- Consider that this is a **healthcare-focused application** aimed at reducing:
+  - Repetitive Strain Injury (RSI)
+  - Tendinitis
+  - Musculoskeletal Disorders (MSD)
+
+---
+
+## Bug Fix Instructions
     
 ==========================================
-General instructions:
-    - include in this zip file any file that needs to be modified because of instructions for bug fixes.
-    - do not modify any file that is not needed to be modified. Only modify code files that need to be updated and include only those files on the result_output.zip file.
-    - on the output zip file include only the .py files that were modified. include the full code for every modified file.
-    - do not update or modify auxiliary files like .md files (README.md) or any other files.
-
-For any situation not clearly specified here or ambiguous descriptions, do the best configuration/implementation you think is possible considering this is a healthcare application designed to reduce RSI — (Repetitive Strain Injury) and/or tendinitis and/or MSD — Musculoskeletal Disorders
+- when application is run with "python main.py" on command line, the tab "Keyboard Actions" is built and initialized. But when a .exe is generated with pyinstaller, it still just displays "Module not present". also, sometimes different icons are used for tray icon, .exe icon and graphical interface icon. make sure all 3 places have same icon. preferably the icon inside assets folder named icon.ico. just generate a icon if the file on this folder is not readable or not an .ico file. if this happens, use the generated icon everywhere.
+==========================================

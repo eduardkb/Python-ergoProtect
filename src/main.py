@@ -37,8 +37,29 @@ import os
 import threading
 import tkinter as tk
 
-# Ensure the project root is on the path when running as "python src/main.py"
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# ---------------------------------------------------------------------------
+# Path helpers — must be resolved before any src.* imports
+# ---------------------------------------------------------------------------
+
+def _get_root() -> str:
+    """
+    Return the project root directory.
+
+    When running as a PyInstaller .exe, sys._MEIPASS points to the temporary
+    folder where bundled files are extracted. When running as plain Python
+    (``python main.py`` or ``python src/main.py``), we walk up from __file__.
+    """
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        # PyInstaller one-file / one-folder bundle
+        return sys._MEIPASS  # type: ignore[attr-defined]
+    # Normal Python execution: __file__ is src/main.py → go up one level
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+_ROOT = _get_root()
+
+# Ensure the project root is on sys.path so that both ``src.*`` imports (normal
+# run) and direct module imports (PyInstaller bundle) can be resolved.
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
@@ -57,44 +78,75 @@ from src import AutoClick  # imported to access the module-level service
 
 
 # ---------------------------------------------------------------------------
-# Icon generation
+# Icon helpers
 # ---------------------------------------------------------------------------
 
-def _load_or_generate_icon() -> "Image.Image":
+def _get_icon_path() -> str:
+    """Return the absolute path to assets/icon.ico."""
+    return os.path.join(_ROOT, "assets", "icon.ico")
+
+
+def _generate_and_save_icon(icon_path: str) -> "Image.Image":
     """
-    Return a PIL Image to use as the tray icon.
+    Programmatically draw a green circle with a white cross (health symbol),
+    save it as a multi-size .ico file at *icon_path*, and return the PIL Image.
 
-    Preference order:
-      1. Load assets/icon.ico if it exists (allows custom branding).
-      2. Programmatically draw a simple green circle with a white cross.
-
-    The programmatic fallback means the app always has a visible tray icon
-    even if the assets folder is missing – important for first-run and
-    portable installs.
+    Saving the file ensures PyInstaller's ``--icon`` flag, the tray icon, and
+    ``iconbitmap()`` all point to the same valid source.
     """
-    icon_path = os.path.join(_ROOT, "assets", "icon.ico")
-    if os.path.exists(icon_path):
-        try:
-            return Image.open(icon_path).convert("RGBA")
-        except Exception as exc:
-            print(f"[main] Could not open icon file: {exc}")
-
-    # --- Fallback: draw a green circle with a white cross ---------------
-    size = 64
+    size = 256
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
     # Green circle background
-    draw.ellipse([2, 2, size - 2, size - 2], fill=(46, 160, 67, 255))
+    draw.ellipse([4, 4, size - 4, size - 4], fill=(46, 160, 67, 255))
 
     # White cross (medical / health symbol)
-    bar = 10          # thickness of each arm
-    arm = 14          # length of each arm from centre
+    bar = 40
+    arm = 70
     cx, cy = size // 2, size // 2
     draw.rectangle([cx - bar // 2, cy - arm, cx + bar // 2, cy + arm], fill="white")
     draw.rectangle([cx - arm, cy - bar // 2, cx + arm, cy + bar // 2], fill="white")
 
+    # Persist as a proper multi-resolution ICO.
+    try:
+        os.makedirs(os.path.dirname(icon_path), exist_ok=True)
+        sizes = [(256, 256), (48, 48), (32, 32), (16, 16)]
+        imgs = [img.resize(s, Image.LANCZOS) for s in sizes]
+        imgs[0].save(
+            icon_path,
+            format="ICO",
+            sizes=sizes,
+            append_images=imgs[1:],
+        )
+        print(f"[main] Generated icon saved to {icon_path}")
+    except Exception as exc:
+        print(f"[main] Could not save generated icon to {icon_path}: {exc}")
+
     return img
+
+
+def _load_or_generate_icon() -> "Image.Image":
+    """
+    Return a PIL Image for the application icon.
+
+    Preference order:
+      1. Load assets/icon.ico if it exists and is a valid .ico image.
+      2. Generate a fallback icon, save it as assets/icon.ico (so that the
+         same file is used for the tray, the GUI title bar, and the .exe
+         file icon when bundled with PyInstaller), and return it.
+    """
+    icon_path = _get_icon_path()
+    if os.path.exists(icon_path):
+        try:
+            img = Image.open(icon_path)
+            img.verify()          # raises on corrupt files
+            img = Image.open(icon_path).convert("RGBA")  # re-open after verify
+            return img
+        except Exception as exc:
+            print(f"[main] Could not open icon file: {exc} — regenerating.")
+
+    return _generate_and_save_icon(icon_path)
 
 
 # ---------------------------------------------------------------------------
@@ -183,15 +235,18 @@ def main() -> None:
 
     # --- Icon image (shared between tray and GUI window) ----------------
     # Load/generate once so both the tray and the GUI window use the same
-    # image object, avoiding redundant file I/O.
+    # image object. If a fallback was generated it is also saved to
+    # assets/icon.ico so GraphicalInterface can use iconbitmap() on the same
+    # file, guaranteeing all three icon surfaces (tray, title bar, .exe) match.
     icon_image = _load_or_generate_icon() if _TRAY_AVAILABLE else None
+    icon_path = _get_icon_path()  # always valid after _load_or_generate_icon()
 
     # --- GUI (hidden on startup) ----------------------------------------
     # The window is created but immediately hidden so the app starts in the
     # tray without flashing a window at the user.
     # The icon_image is passed in so the GUI can display it in the title bar.
     try:
-        gui = GraphicalInterface(config_manager, icon_image=icon_image)
+        gui = GraphicalInterface(config_manager, icon_image=icon_image, icon_path=icon_path)
         gui.hide()
     except Exception as exc:
         log_error("main", "Failed to create GraphicalInterface: %s", exc, exc_info=True)
