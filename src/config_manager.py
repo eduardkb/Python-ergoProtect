@@ -11,7 +11,7 @@ INI File Structure:
 
     Example:
         [General]
-        logfilePath = C:\\Users\\user\\AppData\\Local\\ErgoProtect\\logs
+        logfilePath = C:\\\\Users\\\\user\\\\AppData\\\\Local\\\\ErgoProtect\\\\logs
         DaysToKeepLog = 30
 
         [autoClick]
@@ -19,11 +19,23 @@ INI File Structure:
         activate_key = F6
         milliseconds_stopped = 200
         pixels_threshold = 5
+
+Thread safety
+-------------
+config.ini must never be written concurrently. All writes are serialised
+through a dedicated background writer thread that drains a queue. Callers
+never block: set_config() and save_config() are non-blocking; they enqueue
+a write task which the writer thread performs in FIFO order.
+
+The in-memory ConfigParser state is protected by a re-entrant lock so that
+reads from any thread always see a consistent snapshot.
 """
 
 import configparser
 import os
+import queue
 import sys
+import threading
 from typing import Any
 
 
@@ -100,6 +112,10 @@ class ConfigManager:
     """
     Manages reading and writing ErgoProtect's configuration file.
 
+    All writes are serialised through a single background writer thread to
+    ensure config.ini is never written concurrently by multiple modules.
+    The in-memory state is protected by a re-entrant lock for thread-safe reads.
+
     Usage:
         cfg = ConfigManager()
         value = cfg.get_config("autoClick", "activate_key", "F6")
@@ -115,7 +131,92 @@ class ConfigManager:
         """
         self.config_path = config_path
         self._parser = configparser.ConfigParser()
+        # Re-entrant lock: guards all reads/writes to self._parser
+        self._lock = threading.RLock()
+
+        # Write queue: each item is a sentinel or a callable that performs
+        # the actual file write. Using a queue serialises all disk writes
+        # in FIFO order without ever blocking the calling thread.
+        self._write_queue: queue.Queue = queue.Queue()
+        self._writer_stop = threading.Event()
+        self._writer_thread = threading.Thread(
+            target=self._writer_loop,
+            name="ConfigWriterThread",
+            daemon=True,
+        )
+        self._writer_thread.start()
+
         self._load_or_create()
+
+    # ------------------------------------------------------------------
+    # Background writer thread
+    # ------------------------------------------------------------------
+
+    def _writer_loop(self) -> None:
+        """
+        Drain the write queue and serialise all config.ini writes.
+
+        Items in the queue are zero-argument callables. A None sentinel
+        signals the thread to exit.
+        """
+        while not self._writer_stop.is_set():
+            try:
+                task = self._write_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            if task is None:
+                # Sentinel: exit the loop
+                self._write_queue.task_done()
+                break
+
+            try:
+                task()
+            except Exception as exc:
+                print(f"[ConfigManager] Writer thread error: {exc}")
+            finally:
+                self._write_queue.task_done()
+
+    def _enqueue_write(self) -> None:
+        """
+        Snapshot the current in-memory parser state and enqueue a write task.
+
+        A snapshot is taken immediately (under the lock) so that subsequent
+        set_config() calls cannot race with the queued write. The writer
+        thread only performs the disk I/O, never modifying the snapshot.
+        """
+        with self._lock:
+            # Snapshot: create a fresh parser and copy all current sections/keys
+            snapshot = configparser.ConfigParser()
+            for section in self._parser.sections():
+                snapshot.add_section(section)
+                for key, value in self._parser.items(section):
+                    snapshot.set(section, key, value)
+
+        config_path = self.config_path  # capture for closure
+
+        def _do_write():
+            try:
+                os.makedirs(os.path.dirname(config_path) or ".", exist_ok=True)
+                with open(config_path, "w", encoding="utf-8") as f:
+                    snapshot.write(f)
+            except OSError as exc:
+                print(f"[ConfigManager] Warning: Could not save config — {exc}")
+
+        self._write_queue.put(_do_write)
+
+    def stop_writer(self) -> None:
+        """
+        Flush all pending writes and stop the background writer thread.
+
+        Should be called during application shutdown to ensure no writes
+        are lost. After this call, set_config() and save_config() will
+        still enqueue tasks but the writer thread will no longer drain them;
+        call this only on final exit.
+        """
+        self._write_queue.put(None)
+        self._writer_thread.join(timeout=5.0)
+        self._writer_stop.set()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -128,30 +229,36 @@ class ConfigManager:
         Creating on first run ensures the app always has a valid config
         even if the user has never opened the settings panel.
         """
-        if os.path.exists(self.config_path):
-            self._parser.read(self.config_path, encoding="utf-8")
-            # Ensure all default sections/keys exist (handles partial files
-            # and new keys added in software updates).
-            self._apply_defaults()
-        else:
-            # No config file found — populate with factory defaults
-            self._apply_defaults()
-            self.save_config()
+        with self._lock:
+            if os.path.exists(self.config_path):
+                self._parser.read(self.config_path, encoding="utf-8")
+                # Ensure all default sections/keys exist (handles partial files
+                # and new keys added in software updates).
+                self._apply_defaults_locked()
+            else:
+                # No config file found — populate with factory defaults
+                self._apply_defaults_locked()
+                self._enqueue_write()
 
-    def _apply_defaults(self) -> None:
+    def _apply_defaults_locked(self) -> None:
         """
         Add any missing sections or keys from _DEFAULTS without overwriting
-        existing user values. This lets us add new keys in future versions
-        without breaking existing config files.
+        existing user values. Must be called while self._lock is held.
+
+        This lets us add new keys in future versions without breaking existing
+        config files.
         """
+        changed = False
         for section, keys in _DEFAULTS.items():
             if not self._parser.has_section(section):
                 self._parser.add_section(section)
+                changed = True
             for key, value in keys.items():
                 if not self._parser.has_option(section, key):
                     self._parser.set(section, key, value)
-        # Persist any newly added defaults immediately.
-        self.save_config()
+                    changed = True
+        if changed:
+            self._enqueue_write()
 
     # ------------------------------------------------------------------
     # Public API
@@ -169,10 +276,11 @@ class ConfigManager:
         Returns:
             The stored string value, or `default` if not found.
         """
-        try:
-            return self._parser.get(section, key)
-        except (configparser.NoSectionError, configparser.NoOptionError):
-            return default
+        with self._lock:
+            try:
+                return self._parser.get(section, key)
+            except (configparser.NoSectionError, configparser.NoOptionError):
+                return default
 
     def get_bool(self, section: str, key: str, default: bool = False) -> bool:
         """
@@ -196,34 +304,34 @@ class ConfigManager:
 
     def set_config(self, section: str, key: str, value: Any) -> None:
         """
-        Set a config value and immediately persist it to disk.
+        Set a config value and enqueue an asynchronous persist to disk.
 
-        Saving immediately (rather than batching) ensures no settings are
-        lost if the app crashes or is forcefully closed.
+        The in-memory state is updated synchronously (under the lock) so
+        subsequent get_config() calls immediately see the new value.
+        The disk write is serialised through the writer queue so concurrent
+        calls from multiple modules are ordered safely.
 
         Args:
             section: INI section name.
             key:     Key within that section.
             value:   Value to store (will be converted to string).
         """
-        if not self._parser.has_section(section):
-            self._parser.add_section(section)
-        self._parser.set(section, key, str(value))
-        self.save_config()
+        with self._lock:
+            if not self._parser.has_section(section):
+                self._parser.add_section(section)
+            self._parser.set(section, key, str(value))
+        # Enqueue the disk write outside the lock to minimise contention.
+        self._enqueue_write()
 
     def save_config(self) -> None:
         """
-        Write the current in-memory configuration to disk.
+        Enqueue an explicit persist of the current in-memory configuration.
 
-        Uses a try/except so that a read-only filesystem or permission
-        error doesn't crash the application — it simply skips the save
-        and logs a warning.
+        Prefer set_config() for normal usage (it calls this automatically).
+        Use save_config() only when you need to flush multiple in-memory
+        changes that were made by directly manipulating the parser (internal use).
+
+        The write is asynchronous and serialised through the writer queue,
+        ensuring no concurrent writes to config.ini.
         """
-        try:
-            # Ensure the directory exists (important when running from dist/)
-            os.makedirs(os.path.dirname(self.config_path) or ".", exist_ok=True)
-            with open(self.config_path, "w", encoding="utf-8") as f:
-                self._parser.write(f)
-        except OSError as exc:
-            # Non-fatal: config will be re-created on next launch
-            print(f"[ConfigManager] Warning: Could not save config — {exc}")
+        self._enqueue_write()

@@ -103,7 +103,7 @@ def _load_or_generate_icon() -> "Image.Image":
 
 def _on_open(icon, item, gui: GraphicalInterface) -> None:
     """
-    Callback for the "Open" tray menu item.
+    Callback for the "Open" tray menu item and tray icon double-click.
 
     Because this runs in pystray's thread, we schedule the show() call on
     the Tkinter main thread using root.after() to avoid cross-thread Tk calls.
@@ -181,11 +181,17 @@ def main() -> None:
 
     log_info("main", "ErgoProtect starting up.")
 
+    # --- Icon image (shared between tray and GUI window) ----------------
+    # Load/generate once so both the tray and the GUI window use the same
+    # image object, avoiding redundant file I/O.
+    icon_image = _load_or_generate_icon() if _TRAY_AVAILABLE else None
+
     # --- GUI (hidden on startup) ----------------------------------------
     # The window is created but immediately hidden so the app starts in the
     # tray without flashing a window at the user.
+    # The icon_image is passed in so the GUI can display it in the title bar.
     try:
-        gui = GraphicalInterface(config_manager)
+        gui = GraphicalInterface(config_manager, icon_image=icon_image)
         gui.hide()
     except Exception as exc:
         log_error("main", "Failed to create GraphicalInterface: %s", exc, exc_info=True)
@@ -193,8 +199,6 @@ def main() -> None:
 
     # --- Tray icon ------------------------------------------------------
     if _TRAY_AVAILABLE:
-        icon_image = _load_or_generate_icon()
-
         menu = pystray.Menu(
             pystray.MenuItem("Open ErgoProtect", lambda i, item: _on_open(i, item, gui)),
             pystray.Menu.SEPARATOR,
@@ -209,6 +213,7 @@ def main() -> None:
         )
 
         # Double-clicking the tray icon opens the GUI.
+        # pystray fires the default_action on a double-click on Windows.
         tray_icon.default_action = lambda i, item: _on_open(i, item, gui)
 
         # Run the tray icon in a daemon thread so it doesn't block mainloop()

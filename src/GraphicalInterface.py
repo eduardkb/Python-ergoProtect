@@ -26,9 +26,11 @@ Layout structure
 """
 
 import importlib
+import io
 import os
 import tkinter as tk
 from tkinter import messagebox, ttk
+from typing import Optional
 
 from src.AppLogging import (
     log_debug,
@@ -62,13 +64,14 @@ class GraphicalInterface:
 
     Responsibilities:
       - Create and configure the Tkinter root window.
+      - Apply the application icon to the window title bar (same icon as tray).
       - Build the General tab first (log settings).
       - Build the remaining module-driven notebook tabs.
       - Override the close button to hide (not destroy) the window.
       - Provide show() and hide() methods for the tray icon to call.
     """
 
-    def __init__(self, config_manager) -> None:
+    def __init__(self, config_manager, icon_image=None) -> None:
         """
         Build the window. Does NOT call mainloop() – that is the caller's
         responsibility (see main.py).
@@ -76,8 +79,14 @@ class GraphicalInterface:
         Args:
             config_manager: Shared ConfigManager instance passed into each
                             module's create_tab() so they can read/write config.
+            icon_image:     Optional PIL Image object (already loaded in main.py
+                            for the tray icon). When provided it is also applied
+                            to the window's title-bar icon, ensuring both the tray
+                            and the GUI show the same image. Falls back to loading
+                            assets/icon.ico directly if not provided.
         """
         self._cfg = config_manager
+        self._icon_image = icon_image  # PIL Image or None
         self._root = tk.Tk()
         self._configure_window()
         self._build_tabs()
@@ -94,15 +103,46 @@ class GraphicalInterface:
         self._root.minsize(480, 380)
         self._root.resizable(True, False)
 
-        # Load icon if it exists; degrade gracefully if missing
-        icon_path = os.path.join(
-            os.path.dirname(os.path.dirname(__file__)), "assets", "icon.ico"
-        )
-        if os.path.exists(icon_path):
+        # Apply the window icon. We try multiple strategies so the title bar
+        # always shows the correct icon, matching the tray:
+        #
+        #   1. If a PIL Image was passed in (loaded by main.py for the tray),
+        #      convert it to a Tkinter-compatible PhotoImage and use wm_iconphoto.
+        #      This guarantees the GUI and tray show exactly the same icon.
+        #
+        #   2. Fall back to iconbitmap() using the .ico file on disk (Windows).
+        #
+        #   3. Degrade gracefully with a warning if neither works.
+        icon_set = False
+
+        # Strategy 1: PIL Image → PhotoImage (works on all platforms)
+        if self._icon_image is not None:
             try:
-                self._root.iconbitmap(icon_path)
+                from PIL import ImageTk
+                photo = ImageTk.PhotoImage(self._icon_image)
+                # Keep a reference so it isn't garbage-collected
+                self._root._ergo_icon_photo = photo  # type: ignore[attr-defined]
+                self._root.wm_iconphoto(True, photo)
+                icon_set = True
+                log_debug(_MOD, "Window icon set from PIL image via wm_iconphoto.")
             except Exception as exc:
-                log_warning(_MOD, "Could not load icon: %s", exc)
+                log_warning(_MOD, "Could not set icon via wm_iconphoto (PIL): %s", exc)
+
+        # Strategy 2: .ico file on disk (Windows iconbitmap)
+        if not icon_set:
+            icon_path = os.path.join(
+                os.path.dirname(os.path.dirname(__file__)), "assets", "icon.ico"
+            )
+            if os.path.exists(icon_path):
+                try:
+                    self._root.iconbitmap(icon_path)
+                    icon_set = True
+                    log_debug(_MOD, "Window icon set from .ico file: %s", icon_path)
+                except Exception as exc:
+                    log_warning(_MOD, "Could not load icon from .ico file: %s", exc)
+
+        if not icon_set:
+            log_warning(_MOD, "No window icon could be applied.")
 
         # Override the window close (X) button to hide rather than destroy.
         self._root.protocol("WM_DELETE_WINDOW", self.hide)

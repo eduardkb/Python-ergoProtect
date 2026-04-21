@@ -30,6 +30,14 @@ actions are performed via `pynput.mouse.Controller` which is thread-safe for
 our use case (single writer). GUI callbacks use tkinter's variable trace
 mechanism and stay on the main thread.
 
+Key suppression
+---------------
+All hotkeys are registered with suppress=True. This means the keystroke is
+fully consumed by ErgoProtect and is NOT forwarded to the application that
+currently has focus. Applications such as MS Excel (F7 = spell check),
+VS Code (F8 = next error), or any other program that binds the same function
+keys will NOT receive the event — only ErgoProtect's action runs.
+
 Config.ini section: [keyboardActions]
   leftClickKey   = F7
   rightClickKey  = F8
@@ -189,7 +197,11 @@ class KeyboardActionsService:
         for param, (callback, default) in keys.items():
             key = self._key_for(param, default)
             try:
-                kb_lib.add_hotkey(key, callback, suppress=False)
+                # suppress=True ensures the key event is consumed by ErgoProtect
+                # and is NOT passed through to the currently focused application.
+                # This prevents apps like MS Excel (F7=spell check), VS Code
+                # (F8=next error), etc. from also acting on the same keystroke.
+                kb_lib.add_hotkey(key, callback, suppress=True)
                 log_info(_MOD, "Hotkey registered: %s → %s()", key, callback.__name__)
             except Exception:
                 log_error(_MOD, "Could not register hotkey '%s' for %s.", key, param, exc_info=True)
