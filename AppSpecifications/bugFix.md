@@ -46,8 +46,7 @@ After completing the changes, generate a new `.zip` file containing the updated 
 ## Bug Fix Instructions
     
 ==========================================
-- using the existing appLogging.py module exported functions write logging code for all python files where it makes sense
-- log all exceptions and errors. log other messages where relevant
-- for the main functions (tabs on Graphical interface) if a module could not be loaded specifically log the reason. “module file not found” and "module exists but dependency failed” should be threated as different errors
-- problems while using pyinstaller to generate .exe file if possible should be clearly written on screen during generation process
+- in the KeyboardActions GUI tab on top of all other options add an toggle to enable and disable the keyboard actions functionality.
+- in the KeyboardActions file make sure this section of the application runs on a separate thread (thread activated and deactivated when the "enable Keyboard Actions toggle is pressed on the GUI tab) 
+- for the F10 function (drag-drop hold action configured key), there are several ways configured already to release the left mouse button that was held when the left-click drag-drop configured key was pressed. on these release methods add the press of the same keyboard key (f10 default). so, when f10 is pressed on keyboard, the drag-drop action is initiated and if the drag-drop action is underway, it can be finished with the f10 key (default action key) as well.
 ==========================================

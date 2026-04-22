@@ -100,6 +100,7 @@ _DEFAULTS: dict[str, dict[str, str]] = {
     #                           of the drag-hold while performing single clicks.
     # ---------------------------------------------------------------------------
     "keyboardActions": {
+        "enabled":        "True",
         "leftClickKey":   "F7",
         "rightClickKey":  "F8",
         "doubleClickKey": "F9",

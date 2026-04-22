@@ -41,18 +41,38 @@ import time
 import tkinter as tk
 from tkinter import ttk
 
-# pynput is used for reading cursor position and injecting clicks
+# pynput is used for reading cursor position, injecting clicks, and detecting manual drags
 # keyboard is used for registering the global hotkey
 try:
-    from pynput.mouse import Button, Controller as MouseController
+    from pynput.mouse import Button, Controller as MouseController, Listener as MouseListener
     import keyboard as kb_lib
     _DEPS_AVAILABLE = True
 except ImportError:
     _DEPS_AVAILABLE = False
 
+try:
+    from src.AppLogging import log_info, log_warning, log_error, log_debug
+except ImportError:
+    from AppLogging import log_info, log_warning, log_error, log_debug
+
+# Module identifier used in log calls.
+_MOD = "AutoClick"
+
 # How often (in seconds) the background thread polls mouse position.
 # 20ms gives smooth tracking without hammering the CPU.
 _POLL_INTERVAL_S = 0.02
+
+# Cooldown (seconds) to block autoclick after a drag ends or manual hold is released.
+_POST_DRAG_COOLDOWN_S = 5.0
+
+# Minimum hold duration (seconds) to classify a mouse press as a manual drag.
+_MANUAL_DRAG_THRESHOLD_S = 0.2
+
+# ---------------------------------------------------------------------------
+# Module-level timing state (shared with cross-module interference prevention)
+# ---------------------------------------------------------------------------
+# Timestamp of the last manual drag/hold release (used for cooldown).
+last_mouse_release_time: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -86,13 +106,19 @@ class AutoClickService:
         self._mouse = MouseController() if _DEPS_AVAILABLE else None
         self._hotkey_registered = False
 
+        # Manual drag detection
+        self._press_start_time: float = 0.0
+        self._mouse_listener: MouseListener | None = None
+
+        log_info(_MOD, "Service instance created.")
+
     # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
 
     def start(self) -> None:
         """
-        Start the monitoring thread and register the global hotkey.
+        Start the monitoring thread, manual drag listener, and register the global hotkey.
 
         Guards against double-starting: if a thread is already running this
         is a no-op.
@@ -108,18 +134,20 @@ class AutoClickService:
         )
         self._thread.start()
         self._register_hotkey()
+        self._start_mouse_listener()
+        log_info(_MOD, "AutoClick service started.")
 
     def stop(self) -> None:
         """
         Signal the monitoring thread to stop and wait for it to exit.
-
-        Sets the stop Event (which the loop checks on every iteration)
-        and joins with a short timeout to avoid blocking the GUI thread.
+        Also stops the manual drag listener and unregisters hotkeys.
         """
         self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=1.0)
         self._unregister_hotkey()
+        self._stop_mouse_listener()
+        log_info(_MOD, "AutoClick service stopped.")
 
     def toggle(self) -> None:
         """
@@ -154,10 +182,6 @@ class AutoClickService:
     def _register_hotkey(self) -> None:
         """
         Register the global activation hotkey from config.
-
-        keyboard.add_hotkey works system-wide (even when the app is in the
-        tray), which is exactly what we want so the user can toggle
-        AutoClick without opening the window.
         """
         if not _DEPS_AVAILABLE or self._hotkey_registered:
             return
@@ -165,18 +189,64 @@ class AutoClickService:
         try:
             kb_lib.add_hotkey(key, self.toggle)
             self._hotkey_registered = True
-        except Exception as e:
-            print(f"[AutoClickService] Could not register hotkey '{key}': {e}")
+            log_info(_MOD, "Hotkey registered: %s", key)
+        except Exception:
+            log_error(_MOD, "Could not register hotkey '%s'.", key, exc_info=True)
 
     def _unregister_hotkey(self) -> None:
-        """Remove all registered hotkeys when the service stops."""
+        """Remove registered hotkey when the service stops."""
         if not _DEPS_AVAILABLE or not self._hotkey_registered:
             return
         try:
             kb_lib.unhook_all_hotkeys()
             self._hotkey_registered = False
-        except Exception as e:
-            print(f"[AutoClickService] Could not unregister hotkeys: {e}")
+            log_info(_MOD, "Hotkey unregistered.")
+        except Exception:
+            log_error(_MOD, "Could not unregister hotkeys.", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Manual drag listener (detects user-initiated mouse holds)
+    # ------------------------------------------------------------------
+
+    def _start_mouse_listener(self) -> None:
+        """Start a pynput listener to detect manual mouse drags."""
+        if not _DEPS_AVAILABLE:
+            return
+        try:
+            self._mouse_listener = MouseListener(on_click=self._on_mouse_event)
+            self._mouse_listener.daemon = True
+            self._mouse_listener.start()
+            log_debug(_MOD, "Manual drag listener started.")
+        except Exception:
+            log_error(_MOD, "Could not start mouse listener.", exc_info=True)
+
+    def _stop_mouse_listener(self) -> None:
+        """Stop the pynput listener."""
+        if self._mouse_listener is not None:
+            try:
+                self._mouse_listener.stop()
+            except Exception:
+                pass
+            self._mouse_listener = None
+
+    def _on_mouse_event(self, x, y, button, pressed) -> None:
+        """
+        Track left button press/release to detect manual drags.
+        If left button was held longer than _MANUAL_DRAG_THRESHOLD_S,
+        treat as a drag and block AutoClick for _POST_DRAG_COOLDOWN_S.
+        """
+        global last_mouse_release_time
+        if button == Button.left:
+            if pressed:
+                self._press_start_time = time.monotonic()
+            else:
+                if self._press_start_time > 0:
+                    hold_duration = time.monotonic() - self._press_start_time
+                    if hold_duration >= _MANUAL_DRAG_THRESHOLD_S:
+                        last_mouse_release_time = time.monotonic()
+                        log_debug(_MOD, "Manual drag detected (held %.2fs) — autoclick blocked for %ds.",
+                                  hold_duration, _POST_DRAG_COOLDOWN_S)
+                self._press_start_time = 0.0
 
     # ------------------------------------------------------------------
     # Monitoring loop (runs in background thread)
@@ -186,79 +256,117 @@ class AutoClickService:
         """
         Main loop: polls mouse position and fires a single click when still.
 
-        _click_fired ensures exactly one click per stop. It is set to True
-        after a click and only reset to False when the cursor moves beyond
-        pixels_threshold again — preventing the click-spam bug that occurs
-        when still_since keeps accumulating elapsed time after a click.
+        AutoClick is blocked when:
+          - A keyboard-triggered drag is active (KeyboardActions.drag_active)
+          - Within _POST_DRAG_COOLDOWN_S after a drag ended
+          - Within _POST_DRAG_COOLDOWN_S after a manual mouse hold was released
+
+        Exception rule: NO cooldown is applied to single/right/double clicks
+        triggered by keyboard actions — only the AutoClick idle-fire is blocked.
         """
         if not _DEPS_AVAILABLE:
-            print("[AutoClickService] pynput/keyboard not installed – service disabled.")
+            log_error(_MOD, "pynput/keyboard not installed — AutoClick service disabled.")
             return
 
+        # Lazy import to avoid circular dependency; KeyboardActions may not be loaded yet.
+        try:
+            import KeyboardActions as _ka
+        except ImportError:
+            try:
+                from src import KeyboardActions as _ka
+            except ImportError:
+                _ka = None
+
         last_x, last_y = None, None
-        still_since: float | None = None  # timestamp when cursor last settled
-        _click_fired: bool = False        # True after click; cleared on movement
+        still_since: float | None = None
+        _click_fired: bool = False
 
-        while not self._stop_event.is_set():
-            if not self.is_active():
-                # Not active → reset all tracking state and sleep briefly
-                last_x, last_y = None, None
-                still_since = None
-                _click_fired = False
+        def _is_blocked() -> bool:
+            """Return True if AutoClick should be suppressed right now."""
+            now = time.monotonic()
+            # Check keyboard-triggered drag state
+            if _ka is not None:
+                if getattr(_ka, "drag_active", False):
+                    return True
+                ka_drag_end = getattr(_ka, "last_drag_end_time", 0.0)
+                if now - ka_drag_end < _POST_DRAG_COOLDOWN_S:
+                    return True
+            # Check manual drag cooldown
+            if now - last_mouse_release_time < _POST_DRAG_COOLDOWN_S:
+                return True
+            return False
+
+        try:
+            while not self._stop_event.is_set():
+                if not self.is_active():
+                    last_x, last_y = None, None
+                    still_since = None
+                    _click_fired = False
+                    time.sleep(_POLL_INTERVAL_S)
+                    continue
+
+                # Read fresh thresholds on every pass (respects live GUI edits)
+                ms_stopped = self._cfg.get_int("autoClick", "milliseconds_stopped", 200)
+                px_threshold = self._cfg.get_int("autoClick", "pixels_threshold", 5)
+                seconds_stopped = ms_stopped / 1000.0
+
+                # Sample current cursor position
+                pos = self._mouse.position
+                cur_x, cur_y = pos
+
+                if last_x is None:
+                    last_x, last_y = cur_x, cur_y
+                    still_since = time.monotonic()
+                    _click_fired = False
+                    time.sleep(_POLL_INTERVAL_S)
+                    continue
+
+                distance = math.sqrt((cur_x - last_x) ** 2 + (cur_y - last_y) ** 2)
+
+                if distance > px_threshold:
+                    last_x, last_y = cur_x, cur_y
+                    still_since = time.monotonic()
+                    _click_fired = False
+                else:
+                    elapsed = time.monotonic() - still_since
+                    if elapsed >= seconds_stopped and not _click_fired:
+                        if _is_blocked():
+                            log_debug(_MOD, "AutoClick suppressed — drag active or cooldown.")
+                            # Reset timer so we re-evaluate once unblocked
+                            still_since = time.monotonic()
+                        else:
+                            self._perform_click()
+                            _click_fired = True
+
                 time.sleep(_POLL_INTERVAL_S)
-                continue
 
-            # Read fresh thresholds on every pass (respects live GUI edits)
-            ms_stopped = self._cfg.get_int("autoClick", "milliseconds_stopped", 200)
-            px_threshold = self._cfg.get_int("autoClick", "pixels_threshold", 5)
-            seconds_stopped = ms_stopped / 1000.0
-
-            # Sample current cursor position
-            pos = self._mouse.position
-            cur_x, cur_y = pos
-
-            if last_x is None:
-                # First sample after becoming active — initialise tracking state
-                last_x, last_y = cur_x, cur_y
-                still_since = time.monotonic()
-                _click_fired = False
-                time.sleep(_POLL_INTERVAL_S)
-                continue
-
-            # Euclidean distance from last recorded position
-            distance = math.sqrt((cur_x - last_x) ** 2 + (cur_y - last_y) ** 2)
-
-            if distance > px_threshold:
-                # Cursor moved beyond threshold → update position, restart
-                # the stillness timer, and clear the fired flag so the next
-                # stop can trigger a fresh click.
-                last_x, last_y = cur_x, cur_y
-                still_since = time.monotonic()
-                _click_fired = False
-            else:
-                # Cursor is still (within threshold)
-                elapsed = time.monotonic() - still_since
-                if elapsed >= seconds_stopped and not _click_fired:
-                    # Cursor has been still long enough and no click has fired
-                    # yet for this stop → perform exactly one left-click.
-                    self._perform_click()
-                    _click_fired = True   # block any further clicks until cursor moves
-
-            time.sleep(_POLL_INTERVAL_S)
+        except Exception:
+            log_error(_MOD, "Exception in monitor loop — recovering.", exc_info=True)
+            self._recover()
 
     def _perform_click(self) -> None:
         """
         Inject a left mouse button click at the current cursor position.
-
-        We press and release rather than using .click() to be explicit about
-        what is happening and to make it easier to swap for other button types
-        in the future.
         """
         try:
             self._mouse.press(Button.left)
             self._mouse.release(Button.left)
-        except Exception as e:
-            print(f"[AutoClickService] Click failed: {e}")
+            log_debug(_MOD, "AutoClick fired.")
+        except Exception:
+            log_error(_MOD, "AutoClick click failed.", exc_info=True)
+
+    def _recover(self) -> None:
+        """
+        Failsafe recovery: ensure mouse is released and state is clean.
+        Called after an unexpected exception in the monitor loop.
+        """
+        try:
+            if self._mouse:
+                self._mouse.release(Button.left)
+        except Exception:
+            pass
+        self._cfg.get_bool("autoClick", "active", False)  # reload config
+        log_info(_MOD, "AutoClick recovered from exception.")
 
 
 # ---------------------------------------------------------------------------

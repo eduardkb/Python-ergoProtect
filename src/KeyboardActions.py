@@ -73,11 +73,13 @@ except ImportError:
 # Module identifier used in all log calls.
 _MOD = "KeyboardActions"
 
-# Maximum duration (seconds) for a drag-and-drop hold before auto-release.
-_DRAG_TIMEOUT_S: float = 15.0
-
-# How often (seconds) the drag-drop loop checks its release conditions.
-_DRAG_POLL_S: float = 0.05
+# ---------------------------------------------------------------------------
+# Module-level shared state (read by AutoClick.py for interference prevention)
+# ---------------------------------------------------------------------------
+# True while left mouse button is held for drag-and-drop.
+drag_active: bool = False
+# Timestamp of the last drag-end (used by AutoClick for 5-second cooldown).
+last_drag_end_time: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -100,10 +102,7 @@ class KeyboardActionsService:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._hotkeys_registered = False
-
-        # Drag-drop state — guarded by _drag_lock
         self._drag_lock = threading.Lock()
-        self._drag_active: bool = False   # True while left button is held for drag
 
         log_info(_MOD, "Service instance created.")
 
@@ -116,11 +115,14 @@ class KeyboardActionsService:
         Start the service thread and register all configured hotkeys.
 
         Guard against double-start: if already running this is a no-op.
+        On restart, always performs a clean unhook first to prevent ghost hooks.
         """
         if self._thread and self._thread.is_alive():
             log_warning(_MOD, "start() called but service is already running — ignored.")
             return
 
+        # Always unhook before re-registering to prevent ghost hooks on restart.
+        self._unregister_hotkeys()
         self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._service_loop,
@@ -169,7 +171,7 @@ class KeyboardActionsService:
             # Block until stop() sets the event.
             self._stop_event.wait()
         except Exception:
-            log_error(_MOD, "Unhandled exception in service loop — service stopping.", exc_info=True)
+            log_error(_MOD, "Unhandled exception in service loop — recovering.", exc_info=True)
             self._release_drag_if_active("service loop exception")
         finally:
             self._unregister_hotkeys()
@@ -212,11 +214,13 @@ class KeyboardActionsService:
         self._hotkeys_registered = True
 
     def _unregister_hotkeys(self) -> None:
-        """Remove all registered hotkeys."""
-        if not _DEPS_AVAILABLE or not self._hotkeys_registered:
+        """Remove all registered hotkeys and any other keyboard hooks."""
+        if not _DEPS_AVAILABLE:
             return
         try:
-            kb_lib.unhook_all_hotkeys()
+            # unhook_all removes hotkeys AND any on_press/on_release hooks,
+            # which prevents ghost hooks after restart.
+            kb_lib.unhook_all()
             self._hotkeys_registered = False
             log_info(_MOD, "All hotkeys unregistered.")
         except Exception:
@@ -257,103 +261,34 @@ class KeyboardActionsService:
 
     def _do_drag_drop(self) -> None:
         """
-        Press and hold the left mouse button for drag-and-drop.
+        Toggle drag-and-drop state machine.
 
-        The hold is released when any of the following occurs:
-          • _DRAG_TIMEOUT_S seconds elapse
-          • Any mouse button is pressed (detected via pynput listener)
-          • Any keyboard key is pressed (detected via keyboard library hook)
-          • An exception occurs inside this method
-          • stop() is called (application exit / error)
+        First F10 press:  Press and HOLD left mouse button → drag_active = True
+        Second F10 press: Release left mouse button        → drag_active = False
 
-        Only one drag operation runs at a time. If a drag is already active
-        when this hotkey fires again, the call is silently ignored to prevent
-        double-press accidents.
+        No timeout. No auto-release on key/mouse events. Clean toggle only.
         """
+        global drag_active, last_drag_end_time
+
         with self._drag_lock:
-            if self._drag_active:
-                log_warning(_MOD, "Drag-drop triggered while already active — ignored.")
-                return
-            self._drag_active = True
-
-        log_info(_MOD, "Drag-drop started — holding left button.")
-
-        # Events that signal the hold should end.
-        release_event = threading.Event()
-        release_reason: list[str] = ["unknown"]   # mutable container for thread closure
-
-        # --- Listeners ---------------------------------------------------
-
-        def _on_mouse_click(x, y, button, pressed):
-            """Release drag when any mouse button is pressed."""
-            if pressed:
-                release_reason[0] = f"mouse button pressed ({button})"
-                release_event.set()
-
-        def _on_key_press(event):
-            """Release drag when any keyboard key is pressed."""
-            release_reason[0] = f"keyboard key pressed ({getattr(event, 'name', '?')})"
-            release_event.set()
-
-        mouse_listener = None
-        key_hook = None
-
-        try:
-            from pynput.mouse import Listener as MouseListener
-
-            # Press and hold the left button.
-            self._mouse.press(Button.left)
-
-            # Start listeners AFTER the press so the triggering key event
-            # itself doesn't immediately fire _on_key_press.
-            # A brief sleep lets the keyboard library finish processing the
-            # hotkey event before we hook new_key_press globally.
-            time.sleep(0.05)
-
-            mouse_listener = MouseListener(on_click=_on_mouse_click)
-            mouse_listener.start()
-
-            key_hook = kb_lib.on_press(_on_key_press)
-
-            # Wait for a release condition or timeout.
-            elapsed = 0.0
-            while not release_event.is_set() and not self._stop_event.is_set():
-                time.sleep(_DRAG_POLL_S)
-                elapsed += _DRAG_POLL_S
-                if elapsed >= _DRAG_TIMEOUT_S:
-                    release_reason[0] = f"timeout ({_DRAG_TIMEOUT_S}s elapsed)"
-                    break
-
-            if self._stop_event.is_set():
-                release_reason[0] = "application stop"
-
-        except Exception:
-            release_reason[0] = "exception in drag-drop handler"
-            log_error(_MOD, "Exception during drag-drop hold.", exc_info=True)
-
-        finally:
-            # Always release the mouse button, even if an exception occurred.
-            try:
-                self._mouse.release(Button.left)
-            except Exception:
-                log_error(_MOD, "Failed to release left button after drag-drop.", exc_info=True)
-
-            # Stop listeners.
-            if mouse_listener is not None:
+            if drag_active:
+                # Second press: release the drag
                 try:
-                    mouse_listener.stop()
+                    self._mouse.release(Button.left)
                 except Exception:
-                    pass
-            if key_hook is not None:
+                    log_error(_MOD, "Failed to release left button on drag toggle.", exc_info=True)
+                drag_active = False
+                last_drag_end_time = time.monotonic()
+                log_info(_MOD, "Drag-drop released (F10 toggle off).")
+            else:
+                # First press: start the drag
                 try:
-                    kb_lib.unhook(key_hook)
+                    self._mouse.press(Button.left)
+                    drag_active = True
+                    log_info(_MOD, "Drag-drop started (F10 toggle on) — holding left button.")
                 except Exception:
-                    pass
-
-            with self._drag_lock:
-                self._drag_active = False
-
-            log_info(_MOD, "Drag-drop released. Reason: %s", release_reason[0])
+                    drag_active = False
+                    log_error(_MOD, "Failed to press left button for drag-drop.", exc_info=True)
 
     def _release_drag_if_active(self, reason: str) -> None:
         """
@@ -361,9 +296,12 @@ class KeyboardActionsService:
         Called from stop() and exception handlers to ensure the button is never
         left permanently pressed when the application exits or crashes.
         """
+        global drag_active, last_drag_end_time
         with self._drag_lock:
-            if not self._drag_active:
+            if not drag_active:
                 return
+            drag_active = False
+            last_drag_end_time = time.monotonic()
         try:
             if self._mouse:
                 self._mouse.release(Button.left)
@@ -390,7 +328,8 @@ def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
     Build and return the "Keyboard Actions" settings tab widget.
 
     Called by GraphicalInterface.py when constructing the notebook tabs.
-    Renders all four configurable key fields and wires up the service.
+    Renders an enable/disable toggle at the top, followed by all four
+    configurable key fields, and wires up the service thread accordingly.
 
     Args:
         parent:         The ttk.Notebook tab frame to populate.
@@ -406,13 +345,12 @@ def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
     # --- Ensure keyboardActions section exists in config -----------------
     _ensure_config_defaults(config_manager)
 
-    # --- Initialise service (if not already running) ---------------------
+    # --- Initialise service (but only start it if enabled in config) -----
     if _service is None:
         try:
             _service = KeyboardActionsService(config_manager)
-            _service.start()
         except Exception:
-            log_error(_MOD, "Failed to start KeyboardActionsService.", exc_info=True)
+            log_error(_MOD, "Failed to create KeyboardActionsService.", exc_info=True)
 
     # --- Root frame for this tab -----------------------------------------
     frame = ttk.Frame(parent, padding=20)
@@ -423,7 +361,56 @@ def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
         frame,
         text="Keyboard Actions Settings",
         font=("Segoe UI", 13, "bold"),
-    ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 16))
+    ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
+
+    # --- Enable / Disable toggle (topmost control) -----------------------
+    # Read persisted enabled state; default to True for backwards-compat.
+    _enabled_default = config_manager.get_bool("keyboardActions", "enabled", default=True)
+    enabled_var = tk.BooleanVar(value=_enabled_default)
+
+    toggle_frame = ttk.Frame(frame)
+    toggle_frame.grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 14))
+
+    ttk.Label(
+        toggle_frame,
+        text="Enable Keyboard Actions:",
+        font=("Segoe UI", 10, "bold"),
+    ).pack(side="left", padx=(0, 8))
+
+    def _on_toggle(*_):
+        """Start or stop the service thread based on the toggle state."""
+        enabled = enabled_var.get()
+        config_manager.set_config("keyboardActions", "enabled", str(enabled))
+        if enabled:
+            log_info(_MOD, "Keyboard Actions enabled by user — starting service.")
+            if _service:
+                try:
+                    _service.start()
+                    status_label.config(
+                        text="Service running. Hotkeys are active system-wide.",
+                        foreground="#228822",
+                    )
+                except Exception:
+                    log_error(_MOD, "Failed to start service from toggle.", exc_info=True)
+        else:
+            log_info(_MOD, "Keyboard Actions disabled by user — stopping service.")
+            if _service:
+                try:
+                    _service.stop()
+                    status_label.config(
+                        text="Service stopped. Hotkeys are inactive.",
+                        foreground="#cc4444",
+                    )
+                except Exception:
+                    log_error(_MOD, "Failed to stop service from toggle.", exc_info=True)
+
+    toggle_cb = ttk.Checkbutton(
+        toggle_frame,
+        variable=enabled_var,
+        command=_on_toggle,
+        text="Active",
+    )
+    toggle_cb.pack(side="left")
 
     # Subtitle / description
     ttk.Label(
@@ -436,21 +423,21 @@ def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
         font=("Segoe UI", 9),
         wraplength=520,
         justify="left",
-    ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 14))
+    ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(0, 14))
 
     # Column header labels
     ttk.Label(frame, text="Action", font=("Segoe UI", 9, "bold")).grid(
-        row=2, column=0, sticky="w", pady=4, padx=(0, 12)
+        row=3, column=0, sticky="w", pady=4, padx=(0, 12)
     )
     ttk.Label(frame, text="Hotkey", font=("Segoe UI", 9, "bold")).grid(
-        row=2, column=1, sticky="w", pady=4
+        row=3, column=1, sticky="w", pady=4
     )
     ttk.Label(frame, text="Description", font=("Segoe UI", 9, "bold")).grid(
-        row=2, column=2, sticky="w", pady=4, padx=(12, 0)
+        row=3, column=2, sticky="w", pady=4, padx=(12, 0)
     )
 
     ttk.Separator(frame, orient="horizontal").grid(
-        row=3, column=0, columnspan=3, sticky="ew", pady=(0, 8)
+        row=4, column=0, columnspan=3, sticky="ew", pady=(0, 8)
     )
 
     # --- Action row definitions ------------------------------------------
@@ -479,13 +466,13 @@ def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
             "Drag & Drop",
             (
                 "Press key → hold left button for drag-and-drop.\n"
-                "Released after 15 s, any key/button press, or app close."
+                "Released after 15 s, any key/button press, pressing the key again, or app close."
             ),
         ),
     ]
 
     for idx, (param, default, label, description) in enumerate(actions):
-        row = 4 + idx * 2  # two grid rows per action (entry + spacer)
+        row = 5 + idx * 2  # two grid rows per action (entry + spacer)
 
         # Action label
         ttk.Label(frame, text=label, font=("Segoe UI", 10)).grid(
@@ -533,7 +520,7 @@ def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
         entry.bind("<Return>", save_cb)
 
     # --- Status bar ------------------------------------------------------
-    last_row = 4 + len(actions) * 2
+    last_row = 5 + len(actions) * 2
 
     ttk.Separator(frame, orient="horizontal").grid(
         row=last_row, column=0, columnspan=3, sticky="ew", pady=(20, 8)
@@ -542,19 +529,33 @@ def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
     if not _DEPS_AVAILABLE:
         status_text = "⚠  pynput / keyboard not installed — Keyboard Actions disabled."
         status_color = "#cc4444"
-    else:
+    elif _enabled_default:
         status_text = "Service running. Hotkeys are active system-wide."
-        status_color = "#555555"
+        status_color = "#228822"
+    else:
+        status_text = "Service stopped. Hotkeys are inactive."
+        status_color = "#cc4444"
 
-    ttk.Label(
+    status_label = ttk.Label(
         frame,
         text=status_text,
         foreground=status_color,
         font=("Segoe UI", 9),
-    ).grid(row=last_row + 1, column=0, columnspan=3, sticky="w")
+    )
+    status_label.grid(row=last_row + 1, column=0, columnspan=3, sticky="w")
 
     # Column weights so the description column stretches on resize.
     frame.columnconfigure(2, weight=1)
+
+    # --- Start service thread only if enabled ----------------------------
+    if _enabled_default and _service:
+        try:
+            _service.start()
+            log_info(_MOD, "Service started (enabled at startup).")
+        except Exception:
+            log_error(_MOD, "Failed to start KeyboardActionsService at tab init.", exc_info=True)
+    else:
+        log_info(_MOD, "Service not started — Keyboard Actions is disabled.")
 
     log_info(_MOD, "create_tab() completed successfully.")
     return frame
@@ -571,6 +572,7 @@ def _ensure_config_defaults(config_manager) -> None:
     overwritten.
     """
     defaults = {
+        "enabled":        "True",
         "leftClickKey":   "F7",
         "rightClickKey":  "F8",
         "doubleClickKey": "F9",
