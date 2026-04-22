@@ -31,7 +31,10 @@ After completing the changes, generate a new `.zip` file containing the updated 
 ### 5. Dependencies Between Files
 - If a bug fix requires changes in multiple files, include all affected `.py` files in the output `.zip`.
 
-### 6. Ambiguity Handling
+### 6. Add Logging where needed
+- where it makes sense, add logging messages using functions exported by the AppLogging.py module
+
+### 7. Ambiguity Handling
 - If any instruction is unclear or incomplete, implement the **most reasonable and robust solution**.
 - Consider that this is a **healthcare-focused application** aimed at reducing:
   - Repetitive Strain Injury (RSI)
@@ -43,5 +46,8 @@ After completing the changes, generate a new `.zip` file containing the updated 
 ## Bug Fix Instructions
     
 ==========================================
-- when application is run with "python main.py" on command line, the tab "Keyboard Actions" is built and initialized. But when a .exe is generated with pyinstaller, it still just displays "Module not present".
+- using the existing appLogging.py module exported functions write logging code for all python files where it makes sense
+- log all exceptions and errors. log other messages where relevant
+- for the main functions (tabs on Graphical interface) if a module could not be loaded specifically log the reason. “module file not found” and "module exists but dependency failed” should be threated as different errors
+- problems while using pyinstaller to generate .exe file if possible should be clearly written on screen during generation process
 ==========================================
