@@ -1,6 +1,6 @@
 ## Task Overview
-Analyze the existing project files (provided as a `.zip`). Apply the required modifications described in the **“Instructions for Bug Fixes”** section to the Python code.
-
+Analyze the existing project files (provided as a `.zip`). Apply the required modifications described in the **“Bug Fix Instructions”** section to the Python code.
+Be as efficient as possible writing code to use as few AI resources as possible
 After completing the changes, generate a new `.zip` file containing the updated code.
 
 ---
@@ -15,12 +15,12 @@ After completing the changes, generate a new `.zip` file containing the updated 
 ## General Rules
 
 ### 1. Modify Only What Is Necessary
-- Do not change files unless required by the bug fix instructions.
+- Do not change files unless required by the Bug Fix Instructions.
 - Do not refactor unrelated code.
 
 ### 2. No New Files
 - Do not create new files.
-- Do not generate documentation or auxiliary files.
+- Do not generate documentation files or auxiliary files. Only comment code in-line where needed.
 
 ### 3. Exclude Non-Code Files
 - Do not modify or include files such as `.md`, `README.md`, or any non-Python files.
@@ -29,13 +29,14 @@ After completing the changes, generate a new `.zip` file containing the updated 
 - Each major feature or UI tab in the application must run in a **separate thread**.
 
 ### 5. Dependencies Between Files
-- If a bug fix requires changes in multiple files, include all affected `.py` files in the output `.zip`.
+- If instructions requires changes in multiple files, include all affected `.py` files in the output `.zip`.
 
 ### 6. Add Logging where needed
 - where it makes sense, add logging messages using functions exported by the AppLogging.py module
 
 ### 7. Ambiguity Handling
 - If any instruction is unclear or incomplete, implement the **most reasonable and robust solution**.
+- Do avoid bugs and if a bug is found try to correct it. If instructions are unclear or would introduce a bug on the application, stop the code and .zip file generation and warn me about the situation.
 - Consider that this is a **healthcare-focused application** aimed at reducing:
   - Repetitive Strain Injury (RSI)
   - Tendinitis
@@ -46,7 +47,6 @@ After completing the changes, generate a new `.zip` file containing the updated 
 ## Bug Fix Instructions
     
 ==========================================
-- in the KeyboardActions GUI tab on top of all other options add an toggle to enable and disable the keyboard actions functionality.
-- in the KeyboardActions file make sure this section of the application runs on a separate thread (thread activated and deactivated when the "enable Keyboard Actions toggle is pressed on the GUI tab) 
-- for the F10 function (drag-drop hold action configured key), there are several ways configured already to release the left mouse button that was held when the left-click drag-drop configured key was pressed. on these release methods add the press of the same keyboard key (f10 default). so, when f10 is pressed on keyboard, the drag-drop action is initiated and if the drag-drop action is underway, it can be finished with the f10 key (default action key) as well.
+- Code is still generating a white cross on top of a green circle. it should:
+- Change icon generating logic to generate a modern looking icon having a hand with a finger clicking a button. Theme should be light blue colored.
 ==========================================

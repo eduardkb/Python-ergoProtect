@@ -65,12 +65,13 @@ if _ROOT not in sys.path:
 
 try:
     import pystray
-    from PIL import Image, ImageDraw
+    from PIL import Image
     _TRAY_AVAILABLE = True
 except ImportError:
     _TRAY_AVAILABLE = False
     print("[main] pystray/Pillow not installed – running without tray icon.")
 
+from src.generate_icon import make_icon as _make_icon
 from src.config_manager import ConfigManager
 from src.AppLogging import init_logging, cleanup_old_logs, log_info, log_error, shutdown_logging
 from src.GraphicalInterface import GraphicalInterface
@@ -88,42 +89,20 @@ def _get_icon_path() -> str:
 
 def _generate_and_save_icon(icon_path: str) -> "Image.Image":
     """
-    Programmatically draw a green circle with a white cross (health symbol),
+    Generate the application icon by delegating to generate_icon.make_icon(),
     save it as a multi-size .ico file at *icon_path*, and return the PIL Image.
 
     Saving the file ensures PyInstaller's ``--icon`` flag, the tray icon, and
     ``iconbitmap()`` all point to the same valid source.
     """
-    size = 256
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-
-    # Green circle background
-    draw.ellipse([4, 4, size - 4, size - 4], fill=(46, 160, 67, 255))
-
-    # White cross (medical / health symbol)
-    bar = 40
-    arm = 70
-    cx, cy = size // 2, size // 2
-    draw.rectangle([cx - bar // 2, cy - arm, cx + bar // 2, cy + arm], fill="white")
-    draw.rectangle([cx - arm, cy - bar // 2, cx + arm, cy + bar // 2], fill="white")
-
-    # Persist as a proper multi-resolution ICO.
     try:
         os.makedirs(os.path.dirname(icon_path), exist_ok=True)
-        sizes = [(256, 256), (48, 48), (32, 32), (16, 16)]
-        imgs = [img.resize(s, Image.LANCZOS) for s in sizes]
-        imgs[0].save(
-            icon_path,
-            format="ICO",
-            sizes=sizes,
-            append_images=imgs[1:],
-        )
+        _make_icon(icon_path)
         print(f"[main] Generated icon saved to {icon_path}")
     except Exception as exc:
         print(f"[main] Could not save generated icon to {icon_path}: {exc}")
 
-    return img
+    return Image.open(icon_path).convert("RGBA")
 
 
 def _load_or_generate_icon() -> "Image.Image":

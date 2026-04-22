@@ -1,6 +1,6 @@
 ## Task Overview
 Analyze the existing project files (provided as a `.zip`). Apply the required modifications described in the **“Instructions”** section to the Python code.
-
+Be as efficient as possible writing code to use as few AI resources as possible
 After completing the changes, generate a new `.zip` file containing the updated code.
 
 ---
@@ -20,7 +20,7 @@ After completing the changes, generate a new `.zip` file containing the updated 
 
 ### 2. No New Files
 - Do not create new files.
-- Do not generate documentation or auxiliary files.
+- Do not generate documentation files or auxiliary files. Only comment code in-line where needed.
 
 ### 3. Exclude Non-Code Files
 - Do not modify or include files such as `.md`, `README.md`, or any non-Python files.
@@ -36,6 +36,7 @@ After completing the changes, generate a new `.zip` file containing the updated 
 
 ### 7. Ambiguity Handling
 - If any instruction is unclear or incomplete, implement the **most reasonable and robust solution**.
+- Do avoid bugs and if a bug is found try to correct it. If instructions are unclear or would introduce a bug on the application, stop the code and .zip file generation and warn me about the situation.
 - Consider that this is a **healthcare-focused application** aimed at reducing:
   - Repetitive Strain Injury (RSI)
   - Tendinitis
