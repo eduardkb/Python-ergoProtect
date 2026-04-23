@@ -50,11 +50,12 @@ _MOD = "GraphicalInterface"
 # The module_name is imported relative to the src/ package.
 # "General" is always inserted first programmatically; it does not appear here.
 _TABS = [
-    ("Auto Click",        "AutoClick"),
+    ("Rest Reminder",     "RestReminder"),
+    ("Auto Click",        "AutoClick"),    
     ("Keyboard Actions",  "KeyboardActions"),
     ("Usage Log",         "UsageLog"),
-    ("Usage Graphics",    "UsageGraphics"),
-    ("Rest Reminder",     "RestReminder"),
+    ("Usage Graphics",    "UsageGraphics"),    
+    ("Help",              "Help"),
 ]
 
 
