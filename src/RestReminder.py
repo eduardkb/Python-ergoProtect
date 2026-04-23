@@ -14,7 +14,7 @@ Functionality overview
 
 - Every 2 seconds the monitor thread:
     1. Checks idle time (last_activity -> now). If > reset_of_work_time_minutes,
-       resets all timers (user took a break on their own).
+       resets usage_start and last_activity (but NOT mouse/keyboard timestamps).
     2. Checks session length (usage_start -> last_activity). If >
        continuous_work_minutes AND no postpone timer is active, shows the
        Pause Screen.
@@ -22,17 +22,17 @@ Functionality overview
 - Pause Screen
     - Captures all keyboard and mouse input via pynput global suppressing hooks.
     - Counts down rest_time_seconds.
-    - "Dismiss Rest"  -> releases input, resets timers, closes screen.
+    - "Dismiss Rest"  -> releases input, resets session, closes screen.
     - "Postpone Rest" -> releases input, starts a background delay of
       delay_pause_minutes before re-showing; max 3 postpones.
-    - Timer elapses  -> releases input, resets timers, closes screen.
+    - Timer elapses  -> releases input, resets session, closes screen.
 
 Config.ini section: [RestReminder]
     Active                     = true
     continuous_work_minutes    = 50     (range 40-120)
+    rest_time_seconds          = 300    (range 120-420, i.e. 2-7 minutes)
     delay_pause_minutes        = 10     (range 2-15)
     reset_of_work_time_minutes = 5      (range 1-10)
-    rest_time_seconds          = 300    (range 60-300)
 
 Thread safety
 -------------
@@ -67,17 +67,17 @@ _SECTION = "RestReminder"
 _DEFAULTS = {
     "Active":                    "true",
     "continuous_work_minutes":   "50",
+    "rest_time_seconds":         "300",
     "delay_pause_minutes":       "10",
     "reset_of_work_time_minutes":"5",
-    "rest_time_seconds":         "300",
 }
 
 # Clamp ranges for each numeric parameter (inclusive)
 _RANGES = {
     "continuous_work_minutes":    (40, 120),
+    "rest_time_seconds":          (120, 420),   # 2-7 minutes
     "delay_pause_minutes":        (2, 15),
     "reset_of_work_time_minutes": (1, 10),
-    "rest_time_seconds":          (60, 300),
 }
 
 # Maximum number of times the user may postpone a rest before the button
@@ -87,15 +87,14 @@ _MAX_POSTPONES = 3
 # How often the monitor thread wakes to check timers (seconds).
 _POLL_INTERVAL = 2.0
 
-# Milliseconds to stagger between writing usage_start and the three
-# last_*_activity timestamps (per specification).
+# Milliseconds to stagger between writing usage_start and last_activity.
 _STAGGER_MS = 50
 
 
 # ---------------------------------------------------------------------------
 # Module-level service singleton
 # ---------------------------------------------------------------------------
-_service: "RestReminderService | None" = None
+_service = None  # type: RestReminderService | None
 
 
 # ===========================================================================
@@ -106,10 +105,17 @@ class RestReminderService:
     """
     Background thread that tracks activity timestamps and triggers the
     Pause Screen when the continuous-work threshold is exceeded.
+
+    Key behaviour:
+      - last_kb_activity and last_mouse_activity are NEVER reset; they are
+        only updated when the respective input event fires.
+      - On idle-reset or dismiss/elapsed, only usage_start and last_activity
+        are reset so the session clock starts fresh while preserving the raw
+        input timestamps.
     """
 
-    def __init__(self, config_manager, tk_root: tk.Tk,
-                 icon_image=None, icon_path: str | None = None) -> None:
+    def __init__(self, config_manager, tk_root,
+                 icon_image=None, icon_path=None):
         self._cfg        = config_manager
         self._root       = tk_root
         self._icon_image = icon_image
@@ -119,20 +125,22 @@ class RestReminderService:
         self._lock       = threading.Lock()
         self._stop_event = threading.Event()
 
-        # Activity timestamps (seconds since epoch)
-        self._usage_start:          float = 0.0
-        self._last_activity:        float = 0.0
-        self._last_kb_activity:     float = 0.0
-        self._last_mouse_activity:  float = 0.0
+        # Activity timestamps (seconds since epoch).
+        # last_kb_activity and last_mouse_activity are NEVER reset --
+        # they track the absolute last time that device was used.
+        self._usage_start         = 0.0
+        self._last_activity       = 0.0
+        self._last_kb_activity    = 0.0
+        self._last_mouse_activity = 0.0
 
         # Postpone state
-        self._postpone_count:  int                          = 0
-        self._postpone_active: bool                         = False
-        self._postpone_timer:  threading.Timer | None       = None
+        self._postpone_count  = 0
+        self._postpone_active = False
+        self._postpone_timer  = None
 
         # Pause screen state
-        self._pause_open: bool                              = False
-        self._pause_win:  "PauseScreen | None"              = None
+        self._pause_open = False
+        self._pause_win  = None
 
         # pynput listeners for activity tracking
         self._kb_listener    = None
@@ -149,15 +157,15 @@ class RestReminderService:
     # Public API
     # ------------------------------------------------------------------
 
-    def start(self) -> None:
+    def start(self):
         """Start the monitor thread and global input listeners."""
         log_info(_MOD, "RestReminderService starting.")
-        self._reset_timers()
+        self._reset_session()
         if _PYNPUT_OK:
             self._start_listeners()
         self._thread.start()
 
-    def stop(self) -> None:
+    def stop(self):
         """Stop the monitor thread and release all hooks cleanly."""
         log_info(_MOD, "RestReminderService stopping.")
         self._stop_event.set()
@@ -165,67 +173,66 @@ class RestReminderService:
         if self._postpone_timer:
             self._postpone_timer.cancel()
             self._postpone_timer = None
-        # Schedule pause screen closure on the Tk thread if it is open.
         if self._pause_open and self._pause_win is not None:
             try:
                 self._root.after(0, self._pause_win.force_close)
             except Exception:
                 pass
 
-    def is_running(self) -> bool:
+    def is_running(self):
         """Return True if the monitor thread is alive and not stopping."""
         return self._thread.is_alive() and not self._stop_event.is_set()
 
-    def get_timer_snapshot(self) -> dict:
+    def get_timer_snapshot(self):
         """
-        Return a dict with elapsed seconds for the three activity timers.
-        Keys: 'general', 'mouse', 'keyboard'.
+        Return a dict with timer information.
+
+        Keys:
+          'general'        - elapsed seconds from usage_start to last_activity
+          'mouse_ts'       - raw epoch timestamp of last mouse interaction
+          'keyboard_ts'    - raw epoch timestamp of last keyboard interaction
+          'usage_start_ts' - raw epoch timestamp of usage_start
         """
-        now = time.time()
         with self._lock:
-            start       = self._usage_start
-            last_act    = self._last_activity
-            last_kb     = self._last_kb_activity
-            last_mouse  = self._last_mouse_activity
+            start      = self._usage_start
+            last_act   = self._last_activity
+            last_kb    = self._last_kb_activity
+            last_mouse = self._last_mouse_activity
         return {
-            "general":  max(0.0, last_act   - start),
-            "mouse":    max(0.0, last_mouse  - start),
-            "keyboard": max(0.0, last_kb     - start),
+            "general":        max(0.0, last_act - start),
+            "mouse_ts":       last_mouse,
+            "keyboard_ts":    last_kb,
+            "usage_start_ts": start,
         }
 
     # ------------------------------------------------------------------
     # Timer management
     # ------------------------------------------------------------------
 
-    def _reset_timers(self) -> None:
+    def _reset_session(self):
         """
-        Reset all session timers.
-
-        Per specification:
-          1. Write current timestamp to usage_start_timestamp.
-          2. After _STAGGER_MS milliseconds write current timestamp to the
-             three last_*_activity variables.
+        Reset session timers (usage_start and last_activity only).
+        Does NOT touch last_kb_activity or last_mouse_activity -- those
+        timestamps are only updated by actual input events.
         """
         now = time.time()
         with self._lock:
             self._usage_start = now
         threading.Timer(_STAGGER_MS / 1000.0, self._stagger_activity_reset).start()
-        log_debug(_MOD, "Timers reset. usage_start=%s",
+        log_debug(_MOD, "Session reset. usage_start=%s",
                   time.strftime("%H:%M:%S", time.localtime(now)))
 
-    def _stagger_activity_reset(self) -> None:
-        """Second half of _reset_timers: sets the three last_*_activity vars."""
+    def _stagger_activity_reset(self):
+        """Second half of _reset_session: sets last_activity only."""
         now = time.time()
         with self._lock:
-            self._last_activity       = now
-            self._last_kb_activity    = now
-            self._last_mouse_activity = now
+            self._last_activity = now
 
     # ------------------------------------------------------------------
     # pynput listener management
     # ------------------------------------------------------------------
 
-    def _start_listeners(self) -> None:
+    def _start_listeners(self):
         """Register global pynput keyboard and mouse listeners."""
         try:
             self._kb_listener = _pynput_kb.Listener(
@@ -247,7 +254,7 @@ class RestReminderService:
         except Exception as exc:
             log_error(_MOD, "Failed to start mouse listener: %s", exc, exc_info=True)
 
-    def _stop_listeners(self) -> None:
+    def _stop_listeners(self):
         """Stop pynput activity listeners (best-effort)."""
         for lst in (self._kb_listener, self._mouse_listener):
             if lst:
@@ -259,20 +266,20 @@ class RestReminderService:
         self._mouse_listener = None
 
     # ------------------------------------------------------------------
-    # pynput event callbacks (activity tracking only – no suppression)
+    # pynput event callbacks (activity tracking only - no suppression)
     # ------------------------------------------------------------------
 
-    def _on_key_press(self, key) -> None:
+    def _on_key_press(self, key):
         """Update last_activity and last_kb_activity on any key press."""
         try:
             now = time.time()
             with self._lock:
                 self._last_activity    = now
-                self._last_kb_activity = now
+                self._last_kb_activity = now   # never reset, only updated here
         except Exception as exc:
             log_error(_MOD, "_on_key_press error: %s", exc, exc_info=True)
 
-    def _on_mouse_click(self, x, y, button, pressed) -> None:
+    def _on_mouse_click(self, x, y, button, pressed):
         """
         Update last_activity and last_mouse_activity on physical mouse button
         presses.
@@ -288,12 +295,11 @@ class RestReminderService:
             now = time.time()
             with self._lock:
                 last_kb = self._last_kb_activity
-                # Synthetic if keyboard event within 20 ms before this click.
                 is_synthetic = (now - last_kb) < 0.020
             if not is_synthetic:
                 with self._lock:
                     self._last_activity       = now
-                    self._last_mouse_activity = now
+                    self._last_mouse_activity = now   # never reset, only updated here
         except Exception as exc:
             log_error(_MOD, "_on_mouse_click error: %s", exc, exc_info=True)
 
@@ -301,9 +307,9 @@ class RestReminderService:
     # Monitor loop
     # ------------------------------------------------------------------
 
-    def _run(self) -> None:
+    def _run(self):
         """
-        Main monitor loop – runs every _POLL_INTERVAL seconds in its own
+        Main monitor loop -- runs every _POLL_INTERVAL seconds in its own
         daemon thread (RestReminderThread).
         """
         log_info(_MOD, "RestReminder monitor loop started.")
@@ -315,8 +321,6 @@ class RestReminderService:
                 self._check_timers()
         except Exception as exc:
             log_error(_MOD, "Monitor loop crashed: %s", exc, exc_info=True)
-            # Per specification: on any error stop all hooks to give the user
-            # full control again.
             self._stop_listeners()
             if self._postpone_timer:
                 self._postpone_timer.cancel()
@@ -325,18 +329,18 @@ class RestReminderService:
                         "Full user control restored.")
         log_info(_MOD, "RestReminder monitor loop exited.")
 
-    def _check_timers(self) -> None:
+    def _check_timers(self):
         """
         Evaluate idle and session durations and trigger the pause screen
-        when appropriate.  Raises on error so the monitor loop can stop.
+        when appropriate.
         """
         now = time.time()
         cfg = self._read_config()
 
         with self._lock:
-            last_act       = self._last_activity
-            usage_start    = self._usage_start
-            pause_open     = self._pause_open
+            last_act        = self._last_activity
+            usage_start     = self._usage_start
+            pause_open      = self._pause_open
             postpone_active = self._postpone_active
 
         idle_seconds    = now - last_act
@@ -345,12 +349,14 @@ class RestReminderService:
         reset_threshold = cfg["reset_of_work_time_minutes"] * 60.0
         work_threshold  = cfg["continuous_work_minutes"] * 60.0
 
-        # 1. Idle reset: user has been away long enough – start fresh.
+        # 1. Idle reset: user has been away long enough -- start fresh session.
+        #    Note: only usage_start and last_activity are reset; mouse/kb
+        #    timestamps are preserved.
         if idle_seconds > reset_threshold and not pause_open:
             log_info(_MOD,
                      "Idle reset triggered (idle=%.0fs >= threshold=%.0fs).",
                      idle_seconds, reset_threshold)
-            self._reset_timers()
+            self._reset_session()
             return
 
         # 2. Work limit exceeded: show pause screen.
@@ -367,7 +373,7 @@ class RestReminderService:
     # Pause screen lifecycle
     # ------------------------------------------------------------------
 
-    def _open_pause_screen(self) -> None:
+    def _open_pause_screen(self):
         """Open the PauseScreen (must be called on the Tkinter main thread)."""
         if self._pause_open:
             log_debug(_MOD, "Pause screen already open; skipping.")
@@ -375,38 +381,37 @@ class RestReminderService:
         try:
             cfg = self._read_config()
             with self._lock:
-                self._pause_open    = True
-                postpone_count_now  = self._postpone_count
+                self._pause_open   = True
+                postpone_count_now = self._postpone_count
             self._pause_win = PauseScreen(
-                tk_root       = self._root,
-                rest_seconds  = cfg["rest_time_seconds"],
-                delay_minutes = cfg["delay_pause_minutes"],
-                postpone_count= postpone_count_now,
-                on_dismiss    = self._on_dismiss,
-                on_postpone   = self._on_postpone,
-                on_elapsed    = self._on_elapsed,
-                icon_image    = self._icon_image,
-                icon_path     = self._icon_path,
+                tk_root        = self._root,
+                rest_seconds   = cfg["rest_time_seconds"],
+                delay_minutes  = cfg["delay_pause_minutes"],
+                postpone_count = postpone_count_now,
+                on_dismiss     = self._on_dismiss,
+                on_postpone    = self._on_postpone,
+                on_elapsed     = self._on_elapsed,
+                icon_image     = self._icon_image,
+                icon_path      = self._icon_path,
             )
             log_info(_MOD, "Pause screen opened.")
         except Exception as exc:
             log_error(_MOD, "Failed to open pause screen: %s", exc, exc_info=True)
             with self._lock:
                 self._pause_open = False
-            # Re-raise so the monitor loop handles it per specification.
             raise
 
-    def _on_dismiss(self) -> None:
+    def _on_dismiss(self):
         """Called when the user clicks 'Dismiss Rest'."""
-        log_info(_MOD, "Pause screen dismissed by user; resetting timers.")
+        log_info(_MOD, "Pause screen dismissed by user; resetting session.")
         with self._lock:
             self._pause_open      = False
             self._pause_win       = None
             self._postpone_count  = 0
             self._postpone_active = False
-        self._reset_timers()
+        self._reset_session()
 
-    def _on_postpone(self) -> None:
+    def _on_postpone(self):
         """Called when the user clicks 'Postpone Rest'."""
         cfg = self._read_config()
         with self._lock:
@@ -424,43 +429,43 @@ class RestReminderService:
         self._postpone_timer.daemon = True
         self._postpone_timer.start()
 
-    def _postpone_elapsed(self) -> None:
+    def _postpone_elapsed(self):
         """Called when the postpone countdown finishes."""
         log_info(_MOD, "Postpone timer elapsed; re-showing pause screen.")
         with self._lock:
             self._postpone_active = False
         self._root.after(0, self._open_pause_screen)
 
-    def _on_elapsed(self) -> None:
+    def _on_elapsed(self):
         """Called when the rest countdown on the PauseScreen reaches zero."""
-        log_info(_MOD, "Rest countdown elapsed; resetting timers.")
+        log_info(_MOD, "Rest countdown elapsed; resetting session.")
         with self._lock:
             self._pause_open      = False
             self._pause_win       = None
             self._postpone_count  = 0
             self._postpone_active = False
-        self._reset_timers()
+        self._reset_session()
 
     # ------------------------------------------------------------------
     # Config helper
     # ------------------------------------------------------------------
 
-    def _read_config(self) -> dict:
+    def _read_config(self):
         """Read and clamp numeric [RestReminder] settings from config.ini."""
-        def _clamped(key: str, default: int) -> int:
+        def _clamped(key, default):
             lo, hi = _RANGES.get(key, (1, 9999))
             return max(lo, min(hi, self._cfg.get_int(_SECTION, key, default)))
 
         return {
             "continuous_work_minutes":    _clamped("continuous_work_minutes",    50),
+            "rest_time_seconds":          _clamped("rest_time_seconds",          300),
             "delay_pause_minutes":        _clamped("delay_pause_minutes",        10),
             "reset_of_work_time_minutes": _clamped("reset_of_work_time_minutes",  5),
-            "rest_time_seconds":          _clamped("rest_time_seconds",          300),
         }
 
 
 # ===========================================================================
-# PauseScreen – modal rest-break window (Tk main thread only)
+# PauseScreen - modal rest-break window (Tk main thread only)
 # ===========================================================================
 
 class PauseScreen:
@@ -471,50 +476,34 @@ class PauseScreen:
     Must be instantiated from the Tkinter main thread.
     """
 
-    def __init__(
-        self,
-        tk_root: tk.Tk,
-        rest_seconds: int,
-        delay_minutes: int,
-        postpone_count: int,
-        on_dismiss,
-        on_postpone,
-        on_elapsed,
-        icon_image=None,
-        icon_path: str | None = None,
-    ) -> None:
-        self._root          = tk_root
-        self._rest_seconds  = rest_seconds
-        self._delay_minutes = delay_minutes
-        self._postpone_count= postpone_count
-        self._on_dismiss    = on_dismiss
-        self._on_postpone   = on_postpone
-        self._on_elapsed    = on_elapsed
-        self._icon_image    = icon_image
-        self._icon_path     = icon_path
+    def __init__(self, tk_root, rest_seconds, delay_minutes, postpone_count,
+                 on_dismiss, on_postpone, on_elapsed,
+                 icon_image=None, icon_path=None):
+        self._root           = tk_root
+        self._rest_seconds   = rest_seconds
+        self._delay_minutes  = delay_minutes
+        self._postpone_count = postpone_count
+        self._on_dismiss     = on_dismiss
+        self._on_postpone    = on_postpone
+        self._on_elapsed     = on_elapsed
+        self._icon_image     = icon_image
+        self._icon_path      = icon_path
 
         self._remaining = rest_seconds
         self._closed    = False
 
-        # pynput suppressing listeners (block all user input)
         self._kb_suppress    = None
         self._mouse_suppress = None
 
         self._build_window()
         self._install_input_capture()
-        # Start countdown after window is drawn
         self._win.after(1000, self._tick)
 
-    # ------------------------------------------------------------------
-    # Window construction
-    # ------------------------------------------------------------------
-
-    def _build_window(self) -> None:
+    def _build_window(self):
         """Build and display the pause window, centred on the primary monitor."""
         self._win = tk.Toplevel(self._root)
-        self._win.title("Time to Rest – ErgoProtect")
+        self._win.title("Time to Rest - ErgoProtect")
 
-        # Fixed size centred on screen
         width, height = 540, 360
         sw = self._win.winfo_screenwidth()
         sh = self._win.winfo_screenheight()
@@ -522,19 +511,14 @@ class PauseScreen:
         y  = (sh - height) // 2
         self._win.geometry(f"{width}x{height}+{x}+{y}")
         self._win.resizable(False, False)
-
-        # Remove ALL title-bar decorations (no minimize / maximize / close).
         self._win.overrideredirect(True)
-
-        # Always on top.
         self._win.attributes("-topmost", True)
 
-        # Apply application icon (best-effort)
         if self._icon_image is not None:
             try:
                 from PIL import ImageTk
                 photo = ImageTk.PhotoImage(self._icon_image)
-                self._win._ergo_icon_ref = photo          # prevent GC
+                self._win._ergo_icon_ref = photo
                 self._win.wm_iconphoto(False, photo)
             except Exception:
                 pass
@@ -546,25 +530,18 @@ class PauseScreen:
             except Exception:
                 pass
 
-        # Prevent OS close (belt-and-suspenders alongside overrideredirect)
         self._win.protocol("WM_DELETE_WINDOW", lambda: None)
-
-        # Grab all events for this window on the Tk level too
         self._win.grab_set()
         self._win.focus_force()
 
-        # ------------------------------------------------------------------
-        # Layout
-        # ------------------------------------------------------------------
         BG      = "#1e3a5f"
         FG      = "#ffffff"
         FG_SOFT = "#d0e8ff"
-        FG_CD   = "#ffd700"   # countdown colour
+        FG_CD   = "#ffd700"
 
         outer = tk.Frame(self._win, bg=BG, padx=32, pady=24)
         outer.pack(fill="both", expand=True)
 
-        # Title
         tk.Label(
             outer,
             text="\U0001f33f  Time to Rest",
@@ -572,7 +549,6 @@ class PauseScreen:
             bg=BG, fg=FG,
         ).pack(pady=(0, 10))
 
-        # Friendly message
         tk.Label(
             outer,
             text=(
@@ -586,7 +562,6 @@ class PauseScreen:
             justify="center",
         ).pack(pady=(0, 16))
 
-        # Countdown display
         self._countdown_var = tk.StringVar()
         self._update_countdown_label()
         tk.Label(
@@ -596,7 +571,6 @@ class PauseScreen:
             bg=BG, fg=FG_CD,
         ).pack(pady=(0, 22))
 
-        # Buttons
         btn_frame = tk.Frame(outer, bg=BG)
         btn_frame.pack(side="bottom", pady=(0, 4))
 
@@ -628,21 +602,16 @@ class PauseScreen:
         )
         self._postpone_btn.pack(side="left")
 
-        # Disable postpone if max postpones already reached
         if self._postpone_count >= _MAX_POSTPONES:
             self._postpone_btn.config(state="disabled", bg="#7f8c8d",
                                       cursor="arrow")
 
-    def _update_countdown_label(self) -> None:
+    def _update_countdown_label(self):
         mins = self._remaining // 60
         secs = self._remaining % 60
         self._countdown_var.set(f"{mins:02d}:{secs:02d}")
 
-    # ------------------------------------------------------------------
-    # Countdown tick
-    # ------------------------------------------------------------------
-
-    def _tick(self) -> None:
+    def _tick(self):
         """Decrement countdown by 1 second; schedule next tick or fire elapsed."""
         if self._closed:
             return
@@ -653,19 +622,11 @@ class PauseScreen:
         self._update_countdown_label()
         self._win.after(1000, self._tick)
 
-    # ------------------------------------------------------------------
-    # Input capture (pynput suppressing listeners)
-    # ------------------------------------------------------------------
-
-    def _install_input_capture(self) -> None:
-        """
-        Install pynput suppressing listeners so no keyboard or mouse input
-        reaches any other application while the pause screen is open.
-        """
+    def _install_input_capture(self):
+        """Install pynput suppressing listeners."""
         if not _PYNPUT_OK:
-            log_warning(_MOD, "pynput unavailable – input capture inactive.")
+            log_warning(_MOD, "pynput unavailable - input capture inactive.")
             return
-
         try:
             self._kb_suppress = _pynput_kb.Listener(
                 on_press=self._swallow_key,
@@ -676,7 +637,6 @@ class PauseScreen:
             log_debug(_MOD, "Keyboard suppressing listener started.")
         except Exception as exc:
             log_error(_MOD, "Could not start keyboard suppressor: %s", exc, exc_info=True)
-
         try:
             self._mouse_suppress = _pynput_mouse.Listener(
                 on_click=self._swallow_click,
@@ -688,15 +648,13 @@ class PauseScreen:
         except Exception as exc:
             log_error(_MOD, "Could not start mouse suppressor: %s", exc, exc_info=True)
 
-    def _swallow_key(self, key) -> None:
-        """Consume keyboard events during rest."""
-        pass  # suppress=True already blocks propagation
+    def _swallow_key(self, key):
+        pass
 
-    def _swallow_click(self, x, y, button, pressed) -> None:
-        """Consume mouse click events during rest."""
-        pass  # suppress=True already blocks propagation
+    def _swallow_click(self, x, y, button, pressed):
+        pass
 
-    def _release_input_capture(self) -> None:
+    def _release_input_capture(self):
         """Stop the suppressing listeners and restore normal user control."""
         for lst in (self._kb_suppress, self._mouse_suppress):
             if lst:
@@ -708,12 +666,7 @@ class PauseScreen:
         self._mouse_suppress = None
         log_debug(_MOD, "Input capture released; user control restored.")
 
-    # ------------------------------------------------------------------
-    # Button and timer callbacks
-    # ------------------------------------------------------------------
-
-    def _btn_dismiss(self) -> None:
-        """User clicked 'Dismiss Rest'."""
+    def _btn_dismiss(self):
         if self._closed:
             return
         self._closed = True
@@ -721,8 +674,7 @@ class PauseScreen:
         self._destroy_window()
         self._on_dismiss()
 
-    def _btn_postpone(self) -> None:
-        """User clicked 'Postpone Rest'."""
+    def _btn_postpone(self):
         if self._closed:
             return
         self._closed = True
@@ -730,8 +682,7 @@ class PauseScreen:
         self._destroy_window()
         self._on_postpone()
 
-    def _elapsed_action(self) -> None:
-        """Countdown reached zero naturally."""
+    def _elapsed_action(self):
         if self._closed:
             return
         self._closed = True
@@ -739,19 +690,15 @@ class PauseScreen:
         self._destroy_window()
         self._on_elapsed()
 
-    def force_close(self) -> None:
-        """
-        Forcefully close the screen without firing any service callback.
-        Called when the service is stopped externally (app exit / deactivation).
-        """
+    def force_close(self):
+        """Forcefully close the screen without firing any service callback."""
         if self._closed:
             return
         self._closed = True
         self._release_input_capture()
         self._destroy_window()
 
-    def _destroy_window(self) -> None:
-        """Release the Tk grab and destroy the Toplevel."""
+    def _destroy_window(self):
         try:
             self._win.grab_release()
         except Exception:
@@ -766,11 +713,8 @@ class PauseScreen:
 # GUI tab entry point
 # ===========================================================================
 
-def _ensure_config_defaults(config_manager) -> None:
-    """
-    Add any missing [RestReminder] keys with their defaults to config.ini.
-    Uses ConfigManager.set_config() which is thread-safe and non-blocking.
-    """
+def _ensure_config_defaults(config_manager):
+    """Add any missing [RestReminder] keys with their defaults to config.ini."""
     for key, default in _DEFAULTS.items():
         if config_manager.get_config(_SECTION, key, None) is None:
             config_manager.set_config(_SECTION, key, default)
@@ -778,7 +722,7 @@ def _ensure_config_defaults(config_manager) -> None:
                       _SECTION, key, default)
 
 
-def _fmt_elapsed(seconds: float) -> str:
+def _fmt_elapsed(seconds):
     """Format elapsed seconds as HH:MM:SS."""
     s      = int(seconds)
     h, rem = divmod(s, 3600)
@@ -786,18 +730,21 @@ def _fmt_elapsed(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s2:02d}"
 
 
-def create_tab(parent: tk.Widget, config_manager,
-               tk_root: tk.Tk | None = None,
+def _fmt_timestamp(ts):
+    """Format a unix epoch timestamp as a human-readable local date/time string.
+    Returns '--' if the timestamp is zero (not yet recorded)."""
+    if ts == 0.0:
+        return "--"
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+
+
+def create_tab(parent, config_manager,
+               tk_root=None,
                icon_image=None,
-               icon_path: str | None = None) -> tk.Widget:
+               icon_path=None):
     """
     Build the 'Rest Reminder' settings tab and start the background service
     if Active = true.
-
-    GraphicalInterface calls this as  loaded.create_tab(tab_frame, self._cfg).
-    The extra keyword arguments (tk_root, icon_image, icon_path) have defaults
-    so the standard two-argument call still works; GraphicalInterface is updated
-    to pass them when available.
 
     Returns the outermost widget.
     """
@@ -806,13 +753,12 @@ def create_tab(parent: tk.Widget, config_manager,
     _ensure_config_defaults(config_manager)
     log_info(_MOD, "Building Rest Reminder tab.")
 
-    # Resolve the Tk root for after() and PauseScreen instantiation.
     root = tk_root if tk_root is not None else parent.winfo_toplevel()
 
     # ------------------------------------------------------------------
-    # Service control helpers (closures, safe to call from Tk main thread)
+    # Service control helpers
     # ------------------------------------------------------------------
-    def _start_service() -> None:
+    def _start_service():
         global _service
         if _service and _service.is_running():
             return
@@ -825,7 +771,7 @@ def create_tab(parent: tk.Widget, config_manager,
         _service.start()
         log_info(_MOD, "RestReminderService started.")
 
-    def _stop_service() -> None:
+    def _stop_service():
         global _service
         if _service:
             _service.stop()
@@ -835,11 +781,11 @@ def create_tab(parent: tk.Widget, config_manager,
     # ------------------------------------------------------------------
     # Config read/write helpers
     # ------------------------------------------------------------------
-    def _read_int(key: str, default: int) -> int:
+    def _read_int(key, default):
         lo, hi = _RANGES.get(key, (1, 9999))
         return max(lo, min(hi, config_manager.get_int(_SECTION, key, default)))
 
-    def _save_int(key: str, value: int) -> None:
+    def _save_int(key, value):
         lo, hi = _RANGES.get(key, (1, 9999))
         clamped = max(lo, min(hi, value))
         config_manager.set_config(_SECTION, key, str(clamped))
@@ -858,27 +804,25 @@ def create_tab(parent: tk.Widget, config_manager,
         font=("Segoe UI", 13, "bold"),
     ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 12))
 
-    # --- Activate / Deactivate toggle -----------------------------------
+    # --- Active toggle checkbox -----------------------------------------
     active_val = config_manager.get_bool(_SECTION, "Active", True)
     active_var = tk.BooleanVar(value=active_val)
 
-    def _on_toggle() -> None:
+    def _on_toggle():
         enabled = active_var.get()
         config_manager.set_config(_SECTION, "Active", str(enabled))
         log_info(_MOD, "RestReminder Active toggled to %s.", enabled)
         if enabled:
             _start_service()
-            toggle_btn.config(text="Activated  \u2713")
         else:
             _stop_service()
-            toggle_btn.config(text="Activate")
 
-    toggle_btn = ttk.Button(
+    ttk.Checkbutton(
         frame,
-        text="Activated  \u2713" if active_val else "Activate",
+        text="Active",
+        variable=active_var,
         command=_on_toggle,
-    )
-    toggle_btn.grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 14))
+    ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 14))
 
     # Separator
     ttk.Separator(frame, orient="horizontal").grid(
@@ -886,8 +830,7 @@ def create_tab(parent: tk.Widget, config_manager,
     )
 
     # --- Parameter spinboxes --------------------------------------------
-    def _add_spinbox(label_text: str, cfg_key: str, default: int,
-                     hint: str, row: int) -> None:
+    def _add_spinbox(label_text, cfg_key, default, hint, row):
         lo, hi = _RANGES[cfg_key]
         ttk.Label(frame, text=label_text).grid(
             row=row, column=0, sticky="w", pady=4, padx=(0, 12)
@@ -897,7 +840,7 @@ def create_tab(parent: tk.Widget, config_manager,
                            textvariable=var, width=8)
         spin.grid(row=row, column=1, sticky="w", pady=4)
 
-        def _save(*_args) -> None:
+        def _save(*_args):
             try:
                 _save_int(cfg_key, int(var.get()))
             except (ValueError, tk.TclError):
@@ -913,33 +856,65 @@ def create_tab(parent: tk.Widget, config_manager,
 
     base = 3
 
+    # "Minutes before break" (was "Work Limit")
     _add_spinbox(
-        "Work Limit (minutes):",
+        "Minutes before break:",
         "continuous_work_minutes", 50,
-        f"Show rest reminder after this many consecutive minutes "
-        f"({_RANGES['continuous_work_minutes'][0]}\u2013"
-        f"{_RANGES['continuous_work_minutes'][1]}).",
+        "Show rest reminder after this many consecutive minutes "
+        "(%d\u2013%d)." % _RANGES["continuous_work_minutes"],
         base,
     )
+
+    # "Rest minutes" -- new field (rest_time_seconds stored as seconds, shown as minutes)
+    _REST_MINUTES_ROW = base + 2
+    ttk.Label(frame, text="Rest minutes:").grid(
+        row=_REST_MINUTES_ROW, column=0, sticky="w", pady=4, padx=(0, 12)
+    )
+    _rest_min_default = config_manager.get_int(_SECTION, "rest_time_seconds", 300) // 60
+    _rest_min_default = max(2, min(7, _rest_min_default))
+    rest_min_var  = tk.IntVar(value=_rest_min_default)
+    rest_min_spin = ttk.Spinbox(frame, from_=2, to=7, increment=1,
+                                textvariable=rest_min_var, width=8)
+    rest_min_spin.grid(row=_REST_MINUTES_ROW, column=1, sticky="w", pady=4)
+
+    def _save_rest_minutes(*_args):
+        try:
+            minutes = max(2, min(7, int(rest_min_var.get())))
+            _save_int("rest_time_seconds", minutes * 60)
+        except (ValueError, tk.TclError):
+            pass
+
+    rest_min_spin.bind("<FocusOut>", _save_rest_minutes)
+    rest_min_spin.bind("<Return>",   _save_rest_minutes)
+    rest_min_var.trace_add("write",  _save_rest_minutes)
+
+    ttk.Label(
+        frame,
+        text="Duration of the rest break pause screen (2\u20137 minutes).",
+        foreground="#888888",
+        font=("Segoe UI", 8),
+    ).grid(row=_REST_MINUTES_ROW + 1, column=1, columnspan=2, sticky="w")
+
+    # "Postpone Duration" with updated description
     _add_spinbox(
         "Postpone Duration (min):",
         "delay_pause_minutes", 10,
-        f"Delay before re-showing after postpone "
-        f"({_RANGES['delay_pause_minutes'][0]}\u2013"
-        f"{_RANGES['delay_pause_minutes'][1]}).",
-        base + 2,
-    )
-    _add_spinbox(
-        "Idle Reset (minutes):",
-        "reset_of_work_time_minutes", 5,
-        f"Idle time that automatically resets the session timer "
-        f"({_RANGES['reset_of_work_time_minutes'][0]}\u2013"
-        f"{_RANGES['reset_of_work_time_minutes'][1]}).",
+        "Delay before re-showing pause screen after delay button is clicked "
+        "(%d\u2013%d)." % _RANGES["delay_pause_minutes"],
         base + 4,
     )
 
+    # "Idle Reset"
+    _add_spinbox(
+        "Idle Reset (minutes):",
+        "reset_of_work_time_minutes", 5,
+        "Idle time that automatically resets the session timer "
+        "(%d\u2013%d)." % _RANGES["reset_of_work_time_minutes"],
+        base + 6,
+    )
+
     # --- Separator before timers ----------------------------------------
-    sep_row = base + 7
+    sep_row = base + 9
     ttk.Separator(frame, orient="horizontal").grid(
         row=sep_row, column=0, columnspan=3, sticky="ew", pady=(12, 10)
     )
@@ -951,51 +926,75 @@ def create_tab(parent: tk.Widget, config_manager,
     ).grid(row=sep_row + 1, column=0, columnspan=3, sticky="w", pady=(0, 6))
 
     # Timer display rows
-    general_var  = tk.StringVar(value="00:00:00")
-    mouse_var    = tk.StringVar(value="00:00:00")
-    keyboard_var = tk.StringVar(value="00:00:00")
+    general_var     = tk.StringVar(value="00:00:00")
+    mouse_var       = tk.StringVar(value="--")
+    keyboard_var    = tk.StringVar(value="--")
+    usage_start_var = tk.StringVar(value="--")
 
-    def _timer_row(label: str, var: tk.StringVar, row: int) -> None:
+    def _timer_row(label, var, row, return_label=False):
         ttk.Label(frame, text=label).grid(
             row=row, column=0, sticky="w", pady=2, padx=(0, 12)
         )
-        ttk.Label(
-            frame,
-            textvariable=var,
-            font=("Courier New", 11, "bold"),
-            foreground="#1a6ea8",
-        ).grid(row=row, column=1, sticky="w", pady=2)
+        lbl = ttk.Label(frame, textvariable=var, font=("Courier New", 11, "bold"))
+        lbl.grid(row=row, column=1, sticky="w", pady=2)
+        if return_label:
+            return lbl
 
-    _timer_row("General Interaction:",  general_var,  sep_row + 2)
-    _timer_row("Mouse Interaction:",    mouse_var,    sep_row + 3)
-    _timer_row("Keyboard Interaction:", keyboard_var, sep_row + 4)
+    # General interaction: elapsed time, colour changes when over limit
+    general_lbl = _timer_row("General Interaction:",              general_var,     sep_row + 2, return_label=True)
+    _timer_row("Last Mouse Interaction time:",    mouse_var,       sep_row + 3)
+    _timer_row("Last Keyboard Interaction time:", keyboard_var,    sep_row + 4)
+    _timer_row("Session started:",               usage_start_var, sep_row + 5)
 
-    # Let the entry column expand
+    _DEFAULT_FG    = "#1a6ea8"
+    _OVER_LIMIT_FG = "blue"
+    if general_lbl is not None:
+        general_lbl.configure(foreground=_DEFAULT_FG)
+
     frame.columnconfigure(1, weight=1)
 
     # ------------------------------------------------------------------
-    # Live timer refresh (1 second cadence via after())
+    # Live timer refresh every 2 seconds
     # ------------------------------------------------------------------
-    def _refresh_timers() -> None:
+    def _refresh_timers():
         try:
             if _service and _service.is_running():
                 snap = _service.get_timer_snapshot()
-                general_var.set(_fmt_elapsed(snap["general"]))
-                mouse_var.set(_fmt_elapsed(snap["mouse"]))
-                keyboard_var.set(_fmt_elapsed(snap["keyboard"]))
+
+                # General interaction elapsed time with colour change over limit
+                general_secs = snap["general"]
+                general_var.set(_fmt_elapsed(general_secs))
+                if general_lbl is not None:
+                    try:
+                        work_limit_secs = config_manager.get_int(
+                            _SECTION, "continuous_work_minutes", 50) * 60
+                        fg = _OVER_LIMIT_FG if general_secs > work_limit_secs else _DEFAULT_FG
+                        general_lbl.configure(foreground=fg)
+                    except Exception:
+                        pass
+
+                # Mouse and keyboard: human-readable timestamps
+                mouse_var.set(_fmt_timestamp(snap["mouse_ts"]))
+                keyboard_var.set(_fmt_timestamp(snap["keyboard_ts"]))
+
+                # Session start timestamp
+                usage_start_var.set(_fmt_timestamp(snap["usage_start_ts"]))
             else:
                 general_var.set("--:--:--")
-                mouse_var.set("--:--:--")
-                keyboard_var.set("--:--:--")
+                mouse_var.set("--")
+                keyboard_var.set("--")
+                usage_start_var.set("--")
+                if general_lbl is not None:
+                    general_lbl.configure(foreground=_DEFAULT_FG)
         except Exception as exc:
             log_error(_MOD, "_refresh_timers error: %s", exc, exc_info=True)
         finally:
             try:
-                frame.after(1000, _refresh_timers)
+                frame.after(2000, _refresh_timers)   # every 2 seconds
             except Exception:
                 pass   # Widget was destroyed (app shutdown)
 
-    frame.after(1000, _refresh_timers)
+    frame.after(2000, _refresh_timers)
 
     # ------------------------------------------------------------------
     # Auto-start if Active = true
