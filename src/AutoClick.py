@@ -121,11 +121,15 @@ class AutoClickService:
         Start the monitoring thread, manual drag listener, and register the global hotkey.
 
         Guards against double-starting: if a thread is already running this
-        is a no-op.
+        is a no-op. If a previous thread died (e.g. after an exception), it is
+        replaced so that the service can be cleanly restarted.
         """
         if self._thread and self._thread.is_alive():
             return  # already running
 
+        # Clean up resources from any previous (now-dead) thread before restarting.
+        self._unregister_hotkey()
+        self._stop_mouse_listener()
         self._stop_event.clear()
         self._thread = threading.Thread(
             target=self._monitor_loop,
@@ -154,21 +158,37 @@ class AutoClickService:
         Toggle the active state on/off (called by the hotkey handler).
 
         Thread-safe: uses a Lock so the GUI thread and hotkey thread cannot
-        race on the _active flag.
+        race on the _active flag. If the monitor thread died (e.g. after an
+        exception), toggling back on will restart it automatically.
         """
         with self._lock:
             self._active = not self._active
             self._cfg.set_config("autoClick", "active", str(self._active))
 
+        if self._active:
+            # If the thread crashed and is no longer alive, restart it.
+            if not (self._thread and self._thread.is_alive()):
+                log_warning(_MOD, "Monitor thread was dead — restarting on toggle-on.")
+                self.start()
+
     def set_active(self, active: bool) -> None:
         """
         Explicitly set active state (called by the GUI checkbox).
+
+        If enabling and the monitor thread is dead (e.g. after an exception),
+        the thread is restarted automatically so the service resumes correctly.
 
         Args:
             active: True to enable auto-clicking, False to disable.
         """
         with self._lock:
             self._active = active
+
+        if active:
+            # Restart the thread if it crashed or was never started.
+            if not (self._thread and self._thread.is_alive()):
+                log_warning(_MOD, "Monitor thread not alive — restarting on set_active(True).")
+                self.start()
 
     def is_active(self) -> bool:
         """Return the current active state (thread-safe read)."""
@@ -310,8 +330,18 @@ class AutoClickService:
                 px_threshold = self._cfg.get_int("autoClick", "pixels_threshold", 5)
                 seconds_stopped = ms_stopped / 1000.0
 
-                # Sample current cursor position
+                # Sample current cursor position — pynput may return None briefly
+                # (e.g. during screen-saver, remote desktop handoff, or display change).
                 pos = self._mouse.position
+                if pos is None:
+                    # Position unavailable this tick; reset tracking and wait.
+                    log_debug(_MOD, "Mouse position unavailable (None) — skipping tick.")
+                    last_x, last_y = None, None
+                    still_since = None
+                    _click_fired = False
+                    time.sleep(_POLL_INTERVAL_S)
+                    continue
+
                 cur_x, cur_y = pos
 
                 if last_x is None:
@@ -343,6 +373,8 @@ class AutoClickService:
         except Exception:
             log_error(_MOD, "Exception in monitor loop — recovering.", exc_info=True)
             self._recover()
+            # Signal that this thread has exited abnormally so that the next
+            # call to set_active(True) / toggle() will spawn a fresh thread.
 
     def _perform_click(self) -> None:
         """
@@ -359,14 +391,20 @@ class AutoClickService:
         """
         Failsafe recovery: ensure mouse is released and state is clean.
         Called after an unexpected exception in the monitor loop.
+
+        Clears _stop_event so that the next call to start() / set_active(True)
+        / toggle() can spawn a fresh thread without being blocked.
         """
         try:
             if self._mouse:
                 self._mouse.release(Button.left)
         except Exception:
             pass
-        self._cfg.get_bool("autoClick", "active", False)  # reload config
-        log_info(_MOD, "AutoClick recovered from exception.")
+        # Reload active state from persisted config.
+        self._active = self._cfg.get_bool("autoClick", "active", False)
+        # Clear stop_event so a fresh start() is not immediately cancelled.
+        self._stop_event.clear()
+        log_info(_MOD, "AutoClick recovered from exception — ready for restart.")
 
 
 # ---------------------------------------------------------------------------

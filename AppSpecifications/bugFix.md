@@ -7,6 +7,8 @@ After completing the changes, generate a new `.zip` file containing the updated 
 
 ## Output Requirements
 - The final deliverable must be a `.zip` file.
+- do not write steps being done or explanations. just give me the final `.zip` deliverable.
+- after the final .zip file is delivered, if there still are resources write a summary of what was changed.
 - This `.zip` must include **only the Python (`.py`) files that were modified**.
 - Each included file must contain its **full updated code**, not partial snippets.
 
@@ -47,6 +49,7 @@ After completing the changes, generate a new `.zip` file containing the updated 
 ## Bug Fix Instructions
     
 ==========================================
-- Code is still generating a white cross on top of a green circle. it should:
-- Change icon generating logic to generate a modern looking icon having a hand with a finger clicking a button. Theme should be light blue colored.
+After some time the application is running or after a specific unknown action, the application throws error below. and, after this error happens, terminating and starting the service-specific threads (from autoClick and keyboardActions functionality) do not work anymore. The error is: "Exception in monitor loop â€” recovering. | Traceback (most recent call last):   File "C:\Users\Work\Documents\dev\Python-ergoProtect\src\AutoClick.py", line 315, in _monitor_loop     cur_x, cur_y = pos     ^^^^^^^^^^^^ TypeError: cannot unpack non-iterable NoneType object" Fix it and make sure this threads work and start/stop correctly when needed."
+Change the code to make sure that:
+- wenever an code exception happens or any error happens that prevents functions Auto Click and Keyboard Actions to work, write the code so that disabling the thread and enabling it again forces the specifc function back to normal work.
 ==========================================

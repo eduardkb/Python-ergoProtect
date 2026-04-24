@@ -7,6 +7,8 @@ After completing the changes, generate a new `.zip` file containing the updated 
 
 ## Output Requirements
 - The final deliverable must be a `.zip` file.
+- do not write steps being done or explanations. just give me the final `.zip` deliverable.
+- after the final .zip file is delivered, if there still are resources write a summary of what was changed.
 - This `.zip` must include **only the Python (`.py`) files that were modified**.
 - Each included file must contain its **full updated code**, not partial snippets.
 

@@ -115,7 +115,8 @@ class KeyboardActionsService:
         Start the service thread and register all configured hotkeys.
 
         Guard against double-start: if already running this is a no-op.
-        On restart, always performs a clean unhook first to prevent ghost hooks.
+        On restart (e.g. after an exception), always performs a clean unhook
+        first to prevent ghost hooks, and clears the stop event.
         """
         if self._thread and self._thread.is_alive():
             log_warning(_MOD, "start() called but service is already running — ignored.")
@@ -165,6 +166,10 @@ class KeyboardActionsService:
         All actual work is done in the hotkey callbacks (which run on keyboard
         library's internal thread) — this loop's job is just to keep the
         thread alive and wait for termination.
+
+        On unexpected exception the loop recovers state and clears _stop_event
+        so that the next start() call (triggered by re-enabling the feature)
+        can spawn a fresh thread without being blocked.
         """
         try:
             self._register_hotkeys()
@@ -173,6 +178,8 @@ class KeyboardActionsService:
         except Exception:
             log_error(_MOD, "Unhandled exception in service loop — recovering.", exc_info=True)
             self._release_drag_if_active("service loop exception")
+            # Clear stop_event so a subsequent start() is not immediately cancelled.
+            self._stop_event.clear()
         finally:
             self._unregister_hotkeys()
 
@@ -385,6 +392,11 @@ def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
             log_info(_MOD, "Keyboard Actions enabled by user — starting service.")
             if _service:
                 try:
+                    # If the service thread died (e.g. after an exception), stop()
+                    # cleans up residual state before start() spawns a fresh thread.
+                    if _service._thread and not _service._thread.is_alive():
+                        log_warning(_MOD, "Service thread was dead — performing clean restart.")
+                        _service.stop()
                     _service.start()
                     status_label.config(
                         text="Service running. Hotkeys are active system-wide.",

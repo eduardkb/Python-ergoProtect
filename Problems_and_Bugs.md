@@ -3,6 +3,9 @@
     
 
 - Bugs:
+    - f6 (autoclick activte/deactivte) is not exclusively mapping to the ergoProtect application. it is doing actions on other applications while it should be captured exclusively for this application's functionality.
+    - 5 second auto click stop while manual drag is triggering all the time and blocking the auto click function. ignore drag that happens for less than 500 ms.
+    - Using available log functions exported by the module AppLogging.py, implement logs on all modules (including main.py, GraphicalInterface.py and ConfigManager.py) that currently do not log exceptions or errors or warings being logged. Do write logs where you think they are necessary and/or helpful.
     - moving mouse is not being considered as interaction.
     - rest_time_seconds = 5 (range = 60 to 300) = CHANGE TO MINUTES TO MAKE A STANDARD
     - after long inactive time, the General Interaction timer does not reset to 0. it starts from when it was last reset. after long inactivity, make this timer reset again.
