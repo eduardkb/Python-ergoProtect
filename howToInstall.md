@@ -25,6 +25,7 @@ pyinstaller `
   --icon=assets/icon.ico `
   --add-data "assets/icon.ico;assets" `
   --name ErgoProtect `
+  --clean `
   src/main.py
 ```
 

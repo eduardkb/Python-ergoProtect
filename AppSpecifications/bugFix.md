@@ -49,7 +49,11 @@ After completing the changes, generate a new `.zip` file containing the updated 
 ## Bug Fix Instructions
     
 ==========================================
-After some time the application is running or after a specific unknown action, the application throws error below. and, after this error happens, terminating and starting the service-specific threads (from autoClick and keyboardActions functionality) do not work anymore. The error is: "Exception in monitor loop â€” recovering. | Traceback (most recent call last):   File "C:\Users\Work\Documents\dev\Python-ergoProtect\src\AutoClick.py", line 315, in _monitor_loop     cur_x, cur_y = pos     ^^^^^^^^^^^^ TypeError: cannot unpack non-iterable NoneType object" Fix it and make sure this threads work and start/stop correctly when needed."
-Change the code to make sure that:
-- wenever an code exception happens or any error happens that prevents functions Auto Click and Keyboard Actions to work, write the code so that disabling the thread and enabling it again forces the specifc function back to normal work.
+On Module RestReminder.py
+- Change all instances names of variable "continuous_work_minutes" to "continuous_work_limit_minutes" including writing it to the config.ini file.
+- Change all instances names of variable "rest_time_seconds" to "pause_time_minutes" including writing it to the config.ini file. and change all logic from seconds to minutes including inside variable "_RANGES"
+- Change all instances names of variable "delay_pause_minutes" to "pause_delay_minutes" including writing it to the config.ini file.
+- Change all instances names of variable "reset_of_work_time_minutes" to "clear_continuous_work_minutes" including writing it to the config.ini file.
+
+- considering variables on _RANGES after change above, do validations on the Rest Reminder tab so that user can't change the value on the text boxes out of the range (if a number is inserted out of range, a number in the range is automatically inserted after user leaves the field)
 ==========================================

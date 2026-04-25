@@ -13,26 +13,26 @@ Functionality overview
     last_mouse_activity_timestamp    - last physical mouse button press
 
 - Every 2 seconds the monitor thread:
-    1. Checks idle time (last_activity -> now). If > reset_of_work_time_minutes,
+    1. Checks idle time (last_activity -> now). If > clear_continuous_work_minutes,
        resets usage_start and last_activity (but NOT mouse/keyboard timestamps).
     2. Checks session length (usage_start -> last_activity). If >
-       continuous_work_minutes AND no postpone timer is active, shows the
+       continuous_work_limit_minutes AND no postpone timer is active, shows the
        Pause Screen.
 
 - Pause Screen
     - Captures all keyboard and mouse input via pynput global suppressing hooks.
-    - Counts down rest_time_seconds.
+    - Counts down pause_time_minutes.
     - "Dismiss Rest"  -> releases input, resets session, closes screen.
     - "Postpone Rest" -> releases input, starts a background delay of
-      delay_pause_minutes before re-showing; max 3 postpones.
+      pause_delay_minutes before re-showing; max 3 postpones.
     - Timer elapses  -> releases input, resets session, closes screen.
 
 Config.ini section: [RestReminder]
     Active                     = true
-    continuous_work_minutes    = 50     (range 40-120)
-    rest_time_seconds          = 300    (range 120-420, i.e. 2-7 minutes)
-    delay_pause_minutes        = 10     (range 2-15)
-    reset_of_work_time_minutes = 5      (range 1-10)
+    continuous_work_limit_minutes    = 50     (range 40-120)
+    pause_time_minutes          = 300    (range 120-420, i.e. 2-7 minutes)
+    pause_delay_minutes        = 10     (range 2-15)
+    clear_continuous_work_minutes = 5      (range 1-10)
 
 Thread safety
 -------------
@@ -40,6 +40,16 @@ All timestamp mutations go through a threading.Lock.  Tkinter widgets are
 only created / destroyed on the main Tkinter thread via root.after().
 """
 
+_MOD = "RestReminder"
+
+try:
+    from src.AppLogging import log_debug, log_info, log_warning, log_error
+    log_info(_MOD, "RestReminderService appLogging imported successfully.")
+except ImportError:
+    from AppLogging import log_debug, log_info, log_warning, log_error
+
+
+log_info(_MOD, "RestReminderService importing dependancies.")
 import threading
 import time
 import tkinter as tk
@@ -49,15 +59,12 @@ try:
     from pynput import keyboard as _pynput_kb
     from pynput import mouse as _pynput_mouse
     _PYNPUT_OK = True
-except ImportError:
+    log_info(_MOD, "RestReminderService imported pynput successfully")
+except ImportError as exc:
     _PYNPUT_OK = False
+    log_error(_MOD, "Failed to import pyinput module: %s", exc, exc_info=True)
 
-try:
-    from src.AppLogging import log_debug, log_info, log_warning, log_error
-except ImportError:
-    from AppLogging import log_debug, log_info, log_warning, log_error
-
-_MOD = "RestReminder"
+log_info(_MOD, "RestReminderService finished importing dependancies.")
 
 # ---------------------------------------------------------------------------
 # Config section and defaults
@@ -66,18 +73,18 @@ _SECTION = "RestReminder"
 
 _DEFAULTS = {
     "Active":                    "true",
-    "continuous_work_minutes":   "50",
-    "rest_time_seconds":         "300",
-    "delay_pause_minutes":       "10",
-    "reset_of_work_time_minutes":"5",
+    "continuous_work_limit_minutes":   "2",
+    "pause_time_minutes":         "5",
+    "pause_delay_minutes":       "10",
+    "clear_continuous_work_minutes":"5",
 }
 
 # Clamp ranges for each numeric parameter (inclusive)
 _RANGES = {
-    "continuous_work_minutes":    (40, 120),
-    "rest_time_seconds":          (120, 420),   # 2-7 minutes
-    "delay_pause_minutes":        (2, 15),
-    "reset_of_work_time_minutes": (1, 10),
+    "continuous_work_limit_minutes":    (2, 120),
+    "pause_time_minutes":          (2, 7),      # minutes
+    "pause_delay_minutes":        (2, 15),
+    "clear_continuous_work_minutes": (1, 10),
 }
 
 # Maximum number of times the user may postpone a rest before the button
@@ -346,8 +353,8 @@ class RestReminderService:
         idle_seconds    = now - last_act
         session_seconds = last_act - usage_start
 
-        reset_threshold = cfg["reset_of_work_time_minutes"] * 60.0
-        work_threshold  = cfg["continuous_work_minutes"] * 60.0
+        reset_threshold = cfg["clear_continuous_work_minutes"] * 60.0
+        work_threshold  = cfg["continuous_work_limit_minutes"] * 60.0
 
         # 1. Idle reset: user has been away long enough -- start fresh session.
         #    Note: only usage_start and last_activity are reset; mouse/kb
@@ -385,8 +392,8 @@ class RestReminderService:
                 postpone_count_now = self._postpone_count
             self._pause_win = PauseScreen(
                 tk_root        = self._root,
-                rest_seconds   = cfg["rest_time_seconds"],
-                delay_minutes  = cfg["delay_pause_minutes"],
+                rest_seconds   = cfg["pause_time_minutes"] * 60,
+                delay_minutes  = cfg["pause_delay_minutes"],
                 postpone_count = postpone_count_now,
                 on_dismiss     = self._on_dismiss,
                 on_postpone    = self._on_postpone,
@@ -422,9 +429,9 @@ class RestReminderService:
             self._postpone_active = True
 
         log_info(_MOD, "Rest postponed (%d/%d). Resuming check in %d min.",
-                 count, _MAX_POSTPONES, cfg["delay_pause_minutes"])
+                 count, _MAX_POSTPONES, cfg["pause_delay_minutes"])
 
-        delay_s = cfg["delay_pause_minutes"] * 60.0
+        delay_s = cfg["pause_delay_minutes"] * 60.0
         self._postpone_timer = threading.Timer(delay_s, self._postpone_elapsed)
         self._postpone_timer.daemon = True
         self._postpone_timer.start()
@@ -457,10 +464,10 @@ class RestReminderService:
             return max(lo, min(hi, self._cfg.get_int(_SECTION, key, default)))
 
         return {
-            "continuous_work_minutes":    _clamped("continuous_work_minutes",    50),
-            "rest_time_seconds":          _clamped("rest_time_seconds",          300),
-            "delay_pause_minutes":        _clamped("delay_pause_minutes",        10),
-            "reset_of_work_time_minutes": _clamped("reset_of_work_time_minutes",  5),
+            "continuous_work_limit_minutes":    _clamped("continuous_work_limit_minutes",    50),
+            "pause_time_minutes":          _clamped("pause_time_minutes",          5),
+            "pause_delay_minutes":        _clamped("pause_delay_minutes",        10),
+            "clear_continuous_work_minutes": _clamped("clear_continuous_work_minutes",  5),
         }
 
 
@@ -840,15 +847,29 @@ def create_tab(parent, config_manager,
                            textvariable=var, width=8)
         spin.grid(row=row, column=1, sticky="w", pady=4)
 
-        def _save(*_args):
+        def _clamp_and_save(*_args):
+            """Clamp value to valid range and save. Called on FocusOut/Return."""
+            try:
+                raw = int(var.get())
+            except (ValueError, tk.TclError):
+                raw = _read_int(cfg_key, default)
+            clamped = max(lo, min(hi, raw))
+            if clamped != raw:
+                log_debug(_MOD, "Clamped %s: %d -> %d (range %d-%d)",
+                          cfg_key, raw, clamped, lo, hi)
+            var.set(clamped)
+            _save_int(cfg_key, clamped)
+
+        def _on_trace(*_args):
+            """Called on every keystroke via trace; only save, no clamp mid-edit."""
             try:
                 _save_int(cfg_key, int(var.get()))
             except (ValueError, tk.TclError):
                 pass
 
-        spin.bind("<FocusOut>", _save)
-        spin.bind("<Return>",   _save)
-        var.trace_add("write",  _save)
+        spin.bind("<FocusOut>", _clamp_and_save)
+        spin.bind("<Return>",   _clamp_and_save)
+        var.trace_add("write",  _on_trace)
 
         ttk.Label(
             frame, text=hint, foreground="#888888", font=("Segoe UI", 8)
@@ -859,57 +880,36 @@ def create_tab(parent, config_manager,
     # "Minutes before break" (was "Work Limit")
     _add_spinbox(
         "Minutes before break:",
-        "continuous_work_minutes", 50,
+        "continuous_work_limit_minutes", 50,
         "Show rest reminder after this many consecutive minutes "
-        "(%d\u2013%d)." % _RANGES["continuous_work_minutes"],
+        "(%d\u2013%d)." % _RANGES["continuous_work_limit_minutes"],
         base,
     )
 
-    # "Rest minutes" -- new field (rest_time_seconds stored as seconds, shown as minutes)
-    _REST_MINUTES_ROW = base + 2
-    ttk.Label(frame, text="Rest minutes:").grid(
-        row=_REST_MINUTES_ROW, column=0, sticky="w", pady=4, padx=(0, 12)
+    # "Rest minutes" -- pause_time_minutes is now stored directly in minutes
+    _add_spinbox(
+        "Rest minutes:",
+        "pause_time_minutes", 5,
+        "Duration of the rest break pause screen "
+        "(%d\u2013%d minutes)." % _RANGES["pause_time_minutes"],
+        base + 2,
     )
-    _rest_min_default = config_manager.get_int(_SECTION, "rest_time_seconds", 300) // 60
-    _rest_min_default = max(2, min(7, _rest_min_default))
-    rest_min_var  = tk.IntVar(value=_rest_min_default)
-    rest_min_spin = ttk.Spinbox(frame, from_=2, to=7, increment=1,
-                                textvariable=rest_min_var, width=8)
-    rest_min_spin.grid(row=_REST_MINUTES_ROW, column=1, sticky="w", pady=4)
-
-    def _save_rest_minutes(*_args):
-        try:
-            minutes = max(2, min(7, int(rest_min_var.get())))
-            _save_int("rest_time_seconds", minutes * 60)
-        except (ValueError, tk.TclError):
-            pass
-
-    rest_min_spin.bind("<FocusOut>", _save_rest_minutes)
-    rest_min_spin.bind("<Return>",   _save_rest_minutes)
-    rest_min_var.trace_add("write",  _save_rest_minutes)
-
-    ttk.Label(
-        frame,
-        text="Duration of the rest break pause screen (2\u20137 minutes).",
-        foreground="#888888",
-        font=("Segoe UI", 8),
-    ).grid(row=_REST_MINUTES_ROW + 1, column=1, columnspan=2, sticky="w")
 
     # "Postpone Duration" with updated description
     _add_spinbox(
         "Postpone Duration (min):",
-        "delay_pause_minutes", 10,
+        "pause_delay_minutes", 10,
         "Delay before re-showing pause screen after delay button is clicked "
-        "(%d\u2013%d)." % _RANGES["delay_pause_minutes"],
+        "(%d\u2013%d)." % _RANGES["pause_delay_minutes"],
         base + 4,
     )
 
     # "Idle Reset"
     _add_spinbox(
         "Idle Reset (minutes):",
-        "reset_of_work_time_minutes", 5,
+        "clear_continuous_work_minutes", 5,
         "Idle time that automatically resets the session timer "
-        "(%d\u2013%d)." % _RANGES["reset_of_work_time_minutes"],
+        "(%d\u2013%d)." % _RANGES["clear_continuous_work_minutes"],
         base + 6,
     )
 
@@ -967,7 +967,7 @@ def create_tab(parent, config_manager,
                 if general_lbl is not None:
                     try:
                         work_limit_secs = config_manager.get_int(
-                            _SECTION, "continuous_work_minutes", 50) * 60
+                            _SECTION, "continuous_work_limit_minutes", 50) * 60
                         fg = _OVER_LIMIT_FG if general_secs > work_limit_secs else _DEFAULT_FG
                         general_lbl.configure(foreground=fg)
                     except Exception:
