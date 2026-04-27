@@ -49,7 +49,7 @@ After completing the changes, generate a new `.zip` file containing the updated 
 ## Bug Fix Instructions
     
 ==========================================
-On Module RestReminder.py
-- remove all logic that blocks mouse and keyboard input from the whole module.
-- mouse and keyboard movement or click or key press should not be blocked anymore at any time. not even during the pause screen. clicking and key presses should be allowed anywhere on windows apps on the background and or the pause screen. 
+Fix issues:
+  - in module AutoClick.py analyze the whole module and identify in what situation AutoClick.py is paused for 5 seconds. It is paused for 5 seconds very frequently. Fix this by only implementing this pause when the user initiates a manual drag/drop action and the left mouse button is hold for more than 500 milisseconds. make this pause last for 10 seconds and if any mouse button is pressed (not considering the autoclick) the wait is also cancelled.
+  - in module "RestReminder.py", only mouse clicks and keyboard interactions are considered keyboard and mouse usage. but just moving the mouse should also be considered an interaction and update the mouse time stamps. consider mouse interaction any mouse button click or any movement bigger than 10 pixels.
 ==========================================

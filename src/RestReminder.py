@@ -50,19 +50,28 @@ except ImportError:
 
 
 log_info(_MOD, "RestReminderService importing dependancies.")
+import math
 import threading
 import time
 import tkinter as tk
 from tkinter import ttk
 
 try:
-    from pynput import keyboard as _pynput_kb
-    from pynput import mouse as _pynput_mouse
+    # Use explicit submodule imports (pynput.keyboard.Listener, pynput.mouse.Listener)
+    # instead of "from pynput import keyboard / mouse".
+    # PyInstaller resolves imports by static analysis: "from pynput import keyboard"
+    # relies on pynput's __init__.py lazy-loading mechanism and is invisible to
+    # PyInstaller's dependency scanner, so the keyboard/mouse backends are not
+    # bundled and the module fails at runtime in the .exe.
+    # AutoClick and KeyboardActions already use this direct-submodule pattern and
+    # load correctly from the .exe — RestReminder must match that pattern.
+    from pynput.keyboard import Listener as _pynput_kb_Listener
+    from pynput.mouse import Listener as _pynput_mouse_Listener
     _PYNPUT_OK = True
     log_info(_MOD, "RestReminderService imported pynput successfully")
 except ImportError as exc:
     _PYNPUT_OK = False
-    log_error(_MOD, "Failed to import pyinput module: %s", exc, exc_info=True)
+    log_error(_MOD, "Failed to import pynput module: %s", exc, exc_info=True)
 
 log_info(_MOD, "RestReminderService finished importing dependancies.")
 
@@ -73,18 +82,18 @@ _SECTION = "RestReminder"
 
 _DEFAULTS = {
     "Active":                    "true",
-    "continuous_work_limit_minutes":   "2",
-    "pause_time_minutes":         "5",
-    "pause_delay_minutes":       "10",
+    "continuous_work_limit_minutes":   "50",
+    "pause_time_minutes":         "3",
+    "pause_delay_minutes":       "8",
     "clear_continuous_work_minutes":"5",
 }
 
 # Clamp ranges for each numeric parameter (inclusive)
 _RANGES = {
-    "continuous_work_limit_minutes":    (2, 120),
+    "continuous_work_limit_minutes":    (30, 120),
     "pause_time_minutes":          (2, 7),      # minutes
     "pause_delay_minutes":        (2, 15),
-    "clear_continuous_work_minutes": (1, 10),
+    "clear_continuous_work_minutes": (5, 15),
 }
 
 # Maximum number of times the user may postpone a rest before the button
@@ -152,6 +161,10 @@ class RestReminderService:
         # pynput listeners for activity tracking
         self._kb_listener    = None
         self._mouse_listener = None
+
+        # Last known mouse position used to compute movement distance.
+        # Stored as (x, y) or None before the first move event.
+        self._last_mouse_pos = None
 
         # Daemon thread
         self._thread = threading.Thread(
@@ -242,7 +255,7 @@ class RestReminderService:
     def _start_listeners(self):
         """Register global pynput keyboard and mouse listeners."""
         try:
-            self._kb_listener = _pynput_kb.Listener(
+            self._kb_listener = _pynput_kb_Listener(
                 on_press=self._on_key_press,
                 daemon=True,
             )
@@ -252,8 +265,9 @@ class RestReminderService:
             log_error(_MOD, "Failed to start keyboard listener: %s", exc, exc_info=True)
 
         try:
-            self._mouse_listener = _pynput_mouse.Listener(
+            self._mouse_listener = _pynput_mouse_Listener(
                 on_click=self._on_mouse_click,
+                on_move=self._on_mouse_move,
                 daemon=True,
             )
             self._mouse_listener.start()
@@ -309,6 +323,34 @@ class RestReminderService:
                     self._last_mouse_activity = now   # never reset, only updated here
         except Exception as exc:
             log_error(_MOD, "_on_mouse_click error: %s", exc, exc_info=True)
+
+    def _on_mouse_move(self, x, y):
+        """
+        Update last_activity and last_mouse_activity when the mouse moves
+        more than 10 pixels from the last recorded position.
+
+        Counting movement as activity (not just clicks) gives a more accurate
+        picture of user engagement and reduces false rest-break triggers when
+        the user is actively moving the mouse between targets.
+        """
+        try:
+            prev = self._last_mouse_pos
+            if prev is not None:
+                dx = x - prev[0]
+                dy = y - prev[1]
+                distance = math.sqrt(dx * dx + dy * dy)
+                if distance > 10:
+                    now = time.time()
+                    with self._lock:
+                        self._last_activity       = now
+                        self._last_mouse_activity = now
+                    self._last_mouse_pos = (x, y)
+                    # log_debug(_MOD, "Mouse move >10px (%.1fpx) — activity updated.", distance)
+            else:
+                # First move event: record position without updating timestamps
+                self._last_mouse_pos = (x, y)
+        except Exception as exc:
+            log_error(_MOD, "_on_mouse_move error: %s", exc, exc_info=True)
 
     # ------------------------------------------------------------------
     # Monitor loop

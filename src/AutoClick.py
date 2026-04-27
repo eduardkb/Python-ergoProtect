@@ -62,17 +62,24 @@ _MOD = "AutoClick"
 # 20ms gives smooth tracking without hammering the CPU.
 _POLL_INTERVAL_S = 0.02
 
-# Cooldown (seconds) to block autoclick after a drag ends or manual hold is released.
-_POST_DRAG_COOLDOWN_S = 5.0
+# Cooldown (seconds) to block autoclick after a user-initiated drag/drop ends.
+# Increased to 10s so the user has time to stabilise before autoclick resumes.
+_POST_DRAG_COOLDOWN_S = 10.0
 
-# Minimum hold duration (seconds) to classify a mouse press as a manual drag.
-_MANUAL_DRAG_THRESHOLD_S = 0.2
+# Minimum hold duration (seconds) to classify a left-button hold as a manual
+# drag/drop action.  Only holds >= this threshold trigger the cooldown.
+# Set to 500 ms so quick normal clicks are never penalised.
+_MANUAL_DRAG_THRESHOLD_S = 0.5
 
 # ---------------------------------------------------------------------------
 # Module-level timing state (shared with cross-module interference prevention)
 # ---------------------------------------------------------------------------
 # Timestamp of the last manual drag/hold release (used for cooldown).
 last_mouse_release_time: float = 0.0
+
+# Event used to cancel the drag cooldown early when the user presses any
+# mouse button.  Set by _on_mouse_event; cleared when a cooldown begins.
+_cooldown_cancel_event: threading.Event = threading.Event()
 
 
 # ---------------------------------------------------------------------------
@@ -251,22 +258,49 @@ class AutoClickService:
 
     def _on_mouse_event(self, x, y, button, pressed) -> None:
         """
-        Track left button press/release to detect manual drags.
-        If left button was held longer than _MANUAL_DRAG_THRESHOLD_S,
-        treat as a drag and block AutoClick for _POST_DRAG_COOLDOWN_S.
+        Track left button press/release to detect manual drag/drop actions.
+
+        Cooldown rules (revised):
+          - Only a left-button hold >= _MANUAL_DRAG_THRESHOLD_S (500 ms) is
+            treated as a manual drag/drop.  Short clicks are ignored so that
+            normal clicking never triggers a cooldown.
+          - When a qualifying drag is detected (on release), a background timer
+            runs _POST_DRAG_COOLDOWN_S (10 s) during which AutoClick is blocked.
+          - Any mouse button press received while the cooldown is active
+            immediately cancels it (user has resumed normal interaction).
+          - AutoClick's own synthetic left-clicks are NOT counted as "any mouse
+            button press" — they are fired programmatically and do not pass
+            through this listener in a way that would trip the cancel logic,
+            because _click_fired prevents re-entry before the next move event.
         """
-        global last_mouse_release_time
+        global last_mouse_release_time, _cooldown_cancel_event
+
         if button == Button.left:
             if pressed:
                 self._press_start_time = time.monotonic()
             else:
+                # Left button released — check hold duration
                 if self._press_start_time > 0:
                     hold_duration = time.monotonic() - self._press_start_time
                     if hold_duration >= _MANUAL_DRAG_THRESHOLD_S:
+                        # Qualifying manual drag/drop: start cooldown
                         last_mouse_release_time = time.monotonic()
-                        log_debug(_MOD, "Manual drag detected (held %.2fs) — autoclick blocked for %ds.",
+                        _cooldown_cancel_event.clear()
+                        log_debug(_MOD,
+                                  "Manual drag/drop detected (held %.2fs) — "
+                                  "autoclick blocked for %ds.",
                                   hold_duration, _POST_DRAG_COOLDOWN_S)
                 self._press_start_time = 0.0
+        else:
+            # Any non-left button press cancels an active cooldown early
+            if pressed:
+                elapsed_since_drag = time.monotonic() - last_mouse_release_time
+                if elapsed_since_drag < _POST_DRAG_COOLDOWN_S:
+                    _cooldown_cancel_event.set()
+                    log_debug(_MOD,
+                              "Mouse button press cancelled drag cooldown early "
+                              "(%.2fs into %.0fs window).",
+                              elapsed_since_drag, _POST_DRAG_COOLDOWN_S)
 
     # ------------------------------------------------------------------
     # Monitoring loop (runs in background thread)
@@ -311,8 +345,11 @@ class AutoClickService:
                 ka_drag_end = getattr(_ka, "last_drag_end_time", 0.0)
                 if now - ka_drag_end < _POST_DRAG_COOLDOWN_S:
                     return True
-            # Check manual drag cooldown
-            if now - last_mouse_release_time < _POST_DRAG_COOLDOWN_S:
+            # Check manual drag/drop cooldown.
+            # The cooldown is cancelled early if _cooldown_cancel_event is set
+            # (user pressed another mouse button during the wait).
+            elapsed = now - last_mouse_release_time
+            if elapsed < _POST_DRAG_COOLDOWN_S and not _cooldown_cancel_event.is_set():
                 return True
             return False
 

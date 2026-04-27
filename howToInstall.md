@@ -18,6 +18,12 @@ pip install pyinstaller
 
 Open a PowerShell terminal, navigate to the ErgoProtect project folder, then run:
 
+Delete previous build and cache folders:
+```sh
+Remove-Item -Recurse -Force -ErrorAction SilentlyContinue dist, build, src\__pycache__ -ErrorVariable errs; if ($errs) { Write-Host "Some files could not be deleted (possibly in use):"; $errs | ForEach-Object { Write-Host $_.Exception.Message } }
+```
+
+Create new installer
 ```sh
 pyinstaller `
   --onefile `
