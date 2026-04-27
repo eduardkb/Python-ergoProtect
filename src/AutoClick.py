@@ -3,8 +3,8 @@ AutoClick.py - AutoClick Tab UI and Background Service for ErgoProtect
 -----------------------------------------------------------------------
 This module has two responsibilities:
 
-  1. create_tab()       – builds the Tkinter settings panel shown in the GUI.
-  2. AutoClickService   – a background thread that monitors the mouse and
+  1. create_tab()       - builds the Tkinter settings panel shown in the GUI.
+  2. AutoClickService   - a background thread that monitors the mouse and
                           performs a left-click when the cursor stays still
                           for the configured duration.
 
@@ -13,26 +13,19 @@ Threading model
 The service runs in a daemon thread so Python's interpreter can exit cleanly
 even if the thread is still alive. Communication between the GUI thread and
 the service thread is done via simple Python Events and shared primitive
-values (protected by a Lock where needed). We deliberately avoid queues here
-to keep the code readable.
+values (protected by a Lock where needed).
 
 Mouse-position tracking algorithm
 -----------------------------------
 Every _POLL_INTERVAL_S seconds the service reads the cursor position.
 It computes the Euclidean distance between the new and last-seen position.
-If that distance is less than `pixels_threshold` the cursor is considered
+If that distance is less than pixels_threshold the cursor is considered
 "still"; otherwise the stillness timer resets. When the cursor has been
-still for `milliseconds_stopped` a single left-click is injected.
-A _click_fired flag ensures only ONE click fires per stop — it is cleared
-only when the cursor moves again beyond the threshold.
-
-Why Euclidean distance?
-  √(Δx² + Δy²) is slightly more expensive than Manhattan distance (|Δx|+|Δy|)
-  but behaves like a true circle, which matches how humans perceive "not moved".
+still for milliseconds_stopped a single left-click is injected.
+A _click_fired flag ensures only ONE click fires per stop.
 
 Why left-click only?
   A left-click is the most common interaction and the safest automatic action.
-  Right-click or double-click could trigger unexpected context menus or actions.
 """
 
 import math
@@ -41,8 +34,7 @@ import time
 import tkinter as tk
 from tkinter import ttk
 
-# pynput is used for reading cursor position, injecting clicks, and detecting manual drags
-# keyboard is used for registering the global hotkey
+# pynput for mouse control/listening; keyboard lib for exclusive per-key hotkey.
 try:
     from pynput.mouse import Button, Controller as MouseController, Listener as MouseListener
     import keyboard as kb_lib
@@ -55,67 +47,48 @@ try:
 except ImportError:
     from AppLogging import log_info, log_warning, log_error, log_debug
 
-# Module identifier used in log calls.
 _MOD = "AutoClick"
 
-# How often (in seconds) the background thread polls mouse position.
-# 20ms gives smooth tracking without hammering the CPU.
 _POLL_INTERVAL_S = 0.02
-
-# Cooldown (seconds) to block autoclick after a user-initiated drag/drop ends.
-# Increased to 10s so the user has time to stabilise before autoclick resumes.
 _POST_DRAG_COOLDOWN_S = 10.0
-
-# Minimum hold duration (seconds) to classify a left-button hold as a manual
-# drag/drop action.  Only holds >= this threshold trigger the cooldown.
-# Set to 500 ms so quick normal clicks are never penalised.
 _MANUAL_DRAG_THRESHOLD_S = 0.5
+_POST_ACTIVATION_COOLDOWN_S = 1.0
 
 # ---------------------------------------------------------------------------
-# Module-level timing state (shared with cross-module interference prevention)
+# Module-level timing state
 # ---------------------------------------------------------------------------
-# Timestamp of the last manual drag/hold release (used for cooldown).
 last_mouse_release_time: float = 0.0
-
-# Event used to cancel the drag cooldown early when the user presses any
-# mouse button.  Set by _on_mouse_event; cleared when a cooldown begins.
 _cooldown_cancel_event: threading.Event = threading.Event()
 
-
-# ---------------------------------------------------------------------------
-# Background Service
-# ---------------------------------------------------------------------------
 
 class AutoClickService:
     """
     Background thread that performs a single automatic left-click when the
-    mouse cursor stays within `pixels_threshold` pixels for
-    `milliseconds_stopped` milliseconds. Only one click fires per stop —
-    the cursor must move again before another click can be triggered.
-
-    Typical usage:
-        service = AutoClickService(config_manager)
-        service.start()   # launch the monitoring thread
-        service.stop()    # stop cleanly
-        service.toggle()  # flip active state (used by hotkey)
+    mouse cursor stays within pixels_threshold pixels for milliseconds_stopped
+    milliseconds. Only one click fires per stop.
     """
 
     def __init__(self, config_manager) -> None:
-        """
-        Args:
-            config_manager: A ConfigManager instance for reading settings.
-        """
         self._cfg = config_manager
         self._active = config_manager.get_bool("autoClick", "active", False)
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
-        self._lock = threading.Lock()      # guards _active flag
+        self._lock = threading.Lock()
         self._mouse = MouseController() if _DEPS_AVAILABLE else None
         self._hotkey_registered = False
+        self._hotkey_key: str = ""
 
-        # Manual drag detection
+        # Timestamp of last activation for post-activation cooldown.
+        self._activation_time: float = 0.0
+
+        # Must be True before the first autoclick is allowed after activation.
+        # Reset to False on each activation; set to True once cursor moves >5px.
+        # Prevents clicking the UI element (checkbox/hotkey) used to enable the feature.
+        self._moved_since_activation: bool = False
+
         self._press_start_time: float = 0.0
         self._mouse_listener: MouseListener | None = None
+        self._on_state_change_cb = None
 
         log_info(_MOD, "Service instance created.")
 
@@ -123,25 +96,19 @@ class AutoClickService:
     # Public interface
     # ------------------------------------------------------------------
 
+    def set_state_change_callback(self, cb) -> None:
+        """Register callable(bool) invoked when active state changes via hotkey."""
+        self._on_state_change_cb = cb
+
     def start(self) -> None:
-        """
-        Start the monitoring thread, manual drag listener, and register the global hotkey.
-
-        Guards against double-starting: if a thread is already running this
-        is a no-op. If a previous thread died (e.g. after an exception), it is
-        replaced so that the service can be cleanly restarted.
-        """
+        """Start the monitoring thread, drag listener, and exclusive hotkey."""
         if self._thread and self._thread.is_alive():
-            return  # already running
-
-        # Clean up resources from any previous (now-dead) thread before restarting.
+            return
         self._unregister_hotkey()
         self._stop_mouse_listener()
         self._stop_event.clear()
         self._thread = threading.Thread(
-            target=self._monitor_loop,
-            name="AutoClickMonitor",
-            daemon=True,           # daemon → won't block Python exit
+            target=self._monitor_loop, name="AutoClickMonitor", daemon=True
         )
         self._thread.start()
         self._register_hotkey()
@@ -149,10 +116,7 @@ class AutoClickService:
         log_info(_MOD, "AutoClick service started.")
 
     def stop(self) -> None:
-        """
-        Signal the monitoring thread to stop and wait for it to exit.
-        Also stops the manual drag listener and unregisters hotkeys.
-        """
+        """Signal the thread to stop and clean up resources."""
         self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=1.0)
@@ -162,43 +126,47 @@ class AutoClickService:
 
     def toggle(self) -> None:
         """
-        Toggle the active state on/off (called by the hotkey handler).
-
-        Thread-safe: uses a Lock so the GUI thread and hotkey thread cannot
-        race on the _active flag. If the monitor thread died (e.g. after an
-        exception), toggling back on will restart it automatically.
+        Toggle active state (called by hotkey). Thread-safe.
+        Resets moved_since_activation so the first click after enabling
+        always requires a prior mouse move of >5px.
         """
         with self._lock:
             self._active = not self._active
+            new_state = self._active
             self._cfg.set_config("autoClick", "active", str(self._active))
+            if self._active:
+                self._activation_time = time.monotonic()
+                self._moved_since_activation = False  # require move before first click
 
-        if self._active:
-            # If the thread crashed and is no longer alive, restart it.
-            if not (self._thread and self._thread.is_alive()):
-                log_warning(_MOD, "Monitor thread was dead — restarting on toggle-on.")
-                self.start()
+        log_info(_MOD, "AutoClick toggled via hotkey — now %s.", "ON" if new_state else "OFF")
+
+        if new_state and not (self._thread and self._thread.is_alive()):
+            log_warning(_MOD, "Monitor thread dead — restarting on toggle-on.")
+            self.start()
+
+        if self._on_state_change_cb is not None:
+            try:
+                self._on_state_change_cb(new_state)
+            except Exception:
+                log_error(_MOD, "Error in state-change callback.", exc_info=True)
 
     def set_active(self, active: bool) -> None:
         """
-        Explicitly set active state (called by the GUI checkbox).
-
-        If enabling and the monitor thread is dead (e.g. after an exception),
-        the thread is restarted automatically so the service resumes correctly.
-
-        Args:
-            active: True to enable auto-clicking, False to disable.
+        Explicitly set active state (called by GUI checkbox).
+        Resets moved_since_activation so the first click always requires a move.
         """
         with self._lock:
             self._active = active
+            if active:
+                self._activation_time = time.monotonic()
+                self._moved_since_activation = False  # require move before first click
 
-        if active:
-            # Restart the thread if it crashed or was never started.
-            if not (self._thread and self._thread.is_alive()):
-                log_warning(_MOD, "Monitor thread not alive — restarting on set_active(True).")
-                self.start()
+        if active and not (self._thread and self._thread.is_alive()):
+            log_warning(_MOD, "Monitor thread not alive — restarting on set_active(True).")
+            self.start()
 
     def is_active(self) -> bool:
-        """Return the current active state (thread-safe read)."""
+        """Return the current active state (thread-safe)."""
         with self._lock:
             return self._active
 
@@ -208,31 +176,48 @@ class AutoClickService:
 
     def _register_hotkey(self) -> None:
         """
-        Register the global activation hotkey from config.
+        Register an exclusive per-key hotkey using keyboard.block_key() and
+        keyboard.add_hotkey().
+
+        keyboard.block_key() suppresses only the configured key at the OS
+        driver level so it never reaches other applications. No other keys
+        are affected and no re-injection feedback loop is created.
+
+        NOTE: The previous approach (pynput Listener with suppress=True and
+        re-injecting all other keys via a Controller) caused a full keyboard
+        lockup because the re-injected events were intercepted again by the
+        same suppressing listener, creating an infinite loop.
         """
         if not _DEPS_AVAILABLE or self._hotkey_registered:
             return
         key = self._cfg.get_config("autoClick", "activate_key", "F6")
         try:
-            kb_lib.add_hotkey(key, self.toggle)
+            kb_lib.block_key(key)
+            kb_lib.add_hotkey(key, self.toggle, suppress=True)
             self._hotkey_registered = True
-            log_info(_MOD, "Hotkey registered: %s", key)
+            self._hotkey_key = key
+            log_info(_MOD, "Exclusive hotkey registered (block_key) for key: %s", key)
         except Exception:
             log_error(_MOD, "Could not register hotkey '%s'.", key, exc_info=True)
 
     def _unregister_hotkey(self) -> None:
-        """Remove registered hotkey when the service stops."""
-        if not _DEPS_AVAILABLE or not self._hotkey_registered:
+        """Remove the blocked key and hotkey callback."""
+        if not self._hotkey_registered:
             return
         try:
             kb_lib.unhook_all_hotkeys()
-            self._hotkey_registered = False
-            log_info(_MOD, "Hotkey unregistered.")
+            if self._hotkey_key:
+                try:
+                    kb_lib.unblock_key(self._hotkey_key)
+                except Exception:
+                    pass
         except Exception:
-            log_error(_MOD, "Could not unregister hotkeys.", exc_info=True)
+            pass
+        self._hotkey_registered = False
+        log_info(_MOD, "Hotkey unregistered.")
 
     # ------------------------------------------------------------------
-    # Manual drag listener (detects user-initiated mouse holds)
+    # Manual drag listener
     # ------------------------------------------------------------------
 
     def _start_mouse_listener(self) -> None:
@@ -248,7 +233,7 @@ class AutoClickService:
             log_error(_MOD, "Could not start mouse listener.", exc_info=True)
 
     def _stop_mouse_listener(self) -> None:
-        """Stop the pynput listener."""
+        """Stop the pynput mouse listener."""
         if self._mouse_listener is not None:
             try:
                 self._mouse_listener.stop()
@@ -258,20 +243,8 @@ class AutoClickService:
 
     def _on_mouse_event(self, x, y, button, pressed) -> None:
         """
-        Track left button press/release to detect manual drag/drop actions.
-
-        Cooldown rules (revised):
-          - Only a left-button hold >= _MANUAL_DRAG_THRESHOLD_S (500 ms) is
-            treated as a manual drag/drop.  Short clicks are ignored so that
-            normal clicking never triggers a cooldown.
-          - When a qualifying drag is detected (on release), a background timer
-            runs _POST_DRAG_COOLDOWN_S (10 s) during which AutoClick is blocked.
-          - Any mouse button press received while the cooldown is active
-            immediately cancels it (user has resumed normal interaction).
-          - AutoClick's own synthetic left-clicks are NOT counted as "any mouse
-            button press" — they are fired programmatically and do not pass
-            through this listener in a way that would trip the cancel logic,
-            because _click_fired prevents re-entry before the next move event.
+        Track left button press/release to detect manual drag/drop.
+        Only holds >= _MANUAL_DRAG_THRESHOLD_S trigger the drag cooldown.
         """
         global last_mouse_release_time, _cooldown_cancel_event
 
@@ -279,20 +252,17 @@ class AutoClickService:
             if pressed:
                 self._press_start_time = time.monotonic()
             else:
-                # Left button released — check hold duration
                 if self._press_start_time > 0:
                     hold_duration = time.monotonic() - self._press_start_time
                     if hold_duration >= _MANUAL_DRAG_THRESHOLD_S:
-                        # Qualifying manual drag/drop: start cooldown
                         last_mouse_release_time = time.monotonic()
                         _cooldown_cancel_event.clear()
                         log_debug(_MOD,
-                                  "Manual drag/drop detected (held %.2fs) — "
+                                  "Manual drag detected (held %.2fs) — "
                                   "autoclick blocked for %ds.",
                                   hold_duration, _POST_DRAG_COOLDOWN_S)
                 self._press_start_time = 0.0
         else:
-            # Any non-left button press cancels an active cooldown early
             if pressed:
                 elapsed_since_drag = time.monotonic() - last_mouse_release_time
                 if elapsed_since_drag < _POST_DRAG_COOLDOWN_S:
@@ -303,7 +273,7 @@ class AutoClickService:
                               elapsed_since_drag, _POST_DRAG_COOLDOWN_S)
 
     # ------------------------------------------------------------------
-    # Monitoring loop (runs in background thread)
+    # Monitoring loop
     # ------------------------------------------------------------------
 
     def _monitor_loop(self) -> None:
@@ -311,18 +281,17 @@ class AutoClickService:
         Main loop: polls mouse position and fires a single click when still.
 
         AutoClick is blocked when:
-          - A keyboard-triggered drag is active (KeyboardActions.drag_active)
-          - Within _POST_DRAG_COOLDOWN_S after a drag ended
-          - Within _POST_DRAG_COOLDOWN_S after a manual mouse hold was released
-
-        Exception rule: NO cooldown is applied to single/right/double clicks
-        triggered by keyboard actions — only the AutoClick idle-fire is blocked.
+          - cursor has NOT moved >5px since AutoClick was enabled
+            (first-move requirement prevents clicking the activating UI element)
+          - within _POST_ACTIVATION_COOLDOWN_S after activation (secondary guard)
+          - a keyboard-triggered drag is active
+          - within _POST_DRAG_COOLDOWN_S after a drag ended
+          - within _POST_DRAG_COOLDOWN_S after a manual mouse hold released
         """
         if not _DEPS_AVAILABLE:
-            log_error(_MOD, "pynput/keyboard not installed — AutoClick service disabled.")
+            log_error(_MOD, "pynput/keyboard not installed — AutoClick disabled.")
             return
 
-        # Lazy import to avoid circular dependency; KeyboardActions may not be loaded yet.
         try:
             import KeyboardActions as _ka
         except ImportError:
@@ -334,20 +303,22 @@ class AutoClickService:
         last_x, last_y = None, None
         still_since: float | None = None
         _click_fired: bool = False
+        _FIRST_MOVE_PX = 5  # pixels required to satisfy first-move requirement
 
         def _is_blocked() -> bool:
-            """Return True if AutoClick should be suppressed right now."""
             now = time.monotonic()
-            # Check keyboard-triggered drag state
+            # First-move requirement: cursor must travel >5px after activation.
+            if not self._moved_since_activation:
+                return True
+            # Secondary time-based guard.
+            if now - self._activation_time < _POST_ACTIVATION_COOLDOWN_S:
+                return True
             if _ka is not None:
                 if getattr(_ka, "drag_active", False):
                     return True
                 ka_drag_end = getattr(_ka, "last_drag_end_time", 0.0)
                 if now - ka_drag_end < _POST_DRAG_COOLDOWN_S:
                     return True
-            # Check manual drag/drop cooldown.
-            # The cooldown is cancelled early if _cooldown_cancel_event is set
-            # (user pressed another mouse button during the wait).
             elapsed = now - last_mouse_release_time
             if elapsed < _POST_DRAG_COOLDOWN_S and not _cooldown_cancel_event.is_set():
                 return True
@@ -362,17 +333,13 @@ class AutoClickService:
                     time.sleep(_POLL_INTERVAL_S)
                     continue
 
-                # Read fresh thresholds on every pass (respects live GUI edits)
                 ms_stopped = self._cfg.get_int("autoClick", "milliseconds_stopped", 200)
                 px_threshold = self._cfg.get_int("autoClick", "pixels_threshold", 5)
                 seconds_stopped = ms_stopped / 1000.0
 
-                # Sample current cursor position — pynput may return None briefly
-                # (e.g. during screen-saver, remote desktop handoff, or display change).
                 pos = self._mouse.position
                 if pos is None:
-                    # Position unavailable this tick; reset tracking and wait.
-                    log_debug(_MOD, "Mouse position unavailable (None) — skipping tick.")
+                    log_debug(_MOD, "Mouse position unavailable — skipping tick.")
                     last_x, last_y = None, None
                     still_since = None
                     _click_fired = False
@@ -394,12 +361,15 @@ class AutoClickService:
                     last_x, last_y = cur_x, cur_y
                     still_since = time.monotonic()
                     _click_fired = False
+                    # Satisfy the first-move requirement once cursor moves >5px.
+                    if not self._moved_since_activation and distance > _FIRST_MOVE_PX:
+                        self._moved_since_activation = True
+                        log_debug(_MOD, "First move detected after activation — autoclick now permitted.")
                 else:
                     elapsed = time.monotonic() - still_since
                     if elapsed >= seconds_stopped and not _click_fired:
                         if _is_blocked():
-                            log_debug(_MOD, "AutoClick suppressed — drag active or cooldown.")
-                            # Reset timer so we re-evaluate once unblocked
+                            log_debug(_MOD, "AutoClick suppressed — awaiting first move, drag, or cooldown.")
                             still_since = time.monotonic()
                         else:
                             self._perform_click()
@@ -410,13 +380,9 @@ class AutoClickService:
         except Exception:
             log_error(_MOD, "Exception in monitor loop — recovering.", exc_info=True)
             self._recover()
-            # Signal that this thread has exited abnormally so that the next
-            # call to set_active(True) / toggle() will spawn a fresh thread.
 
     def _perform_click(self) -> None:
-        """
-        Inject a left mouse button click at the current cursor position.
-        """
+        """Inject a left mouse button click at the current cursor position."""
         try:
             self._mouse.press(Button.left)
             self._mouse.release(Button.left)
@@ -425,21 +391,13 @@ class AutoClickService:
             log_error(_MOD, "AutoClick click failed.", exc_info=True)
 
     def _recover(self) -> None:
-        """
-        Failsafe recovery: ensure mouse is released and state is clean.
-        Called after an unexpected exception in the monitor loop.
-
-        Clears _stop_event so that the next call to start() / set_active(True)
-        / toggle() can spawn a fresh thread without being blocked.
-        """
+        """Failsafe: release mouse and reset state after an unexpected exception."""
         try:
             if self._mouse:
                 self._mouse.release(Button.left)
         except Exception:
             pass
-        # Reload active state from persisted config.
         self._active = self._cfg.get_bool("autoClick", "active", False)
-        # Clear stop_event so a fresh start() is not immediately cancelled.
         self._stop_event.clear()
         log_info(_MOD, "AutoClick recovered from exception — ready for restart.")
 
@@ -448,7 +406,6 @@ class AutoClickService:
 # GUI Tab
 # ---------------------------------------------------------------------------
 
-# Module-level reference to the running service (shared with main.py)
 _service: AutoClickService | None = None
 
 
@@ -461,50 +418,33 @@ def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
     """
     Build and return the AutoClick settings tab widget.
 
-    This function is called by GraphicalInterface.py when constructing
-    the notebook tabs. It both renders the UI and wires up the service.
-
-    Args:
-        parent:         The ttk.Notebook tab frame to populate.
-        config_manager: Shared ConfigManager instance.
-
-    Returns:
-        The populated Frame widget (not strictly needed but useful for tests).
+    Called by GraphicalInterface.py. Renders the UI, wires up the service,
+    and registers the hotkey->checkbox sync callback.
     """
     global _service
 
-    # --- Initialise service (if not already running) --------------------
     if _service is None:
         _service = AutoClickService(config_manager)
         _service.start()
 
-    # --- Root frame for this tab ----------------------------------------
     frame = ttk.Frame(parent, padding=20)
     frame.pack(fill="both", expand=True)
 
-    # Title label
-    title = ttk.Label(frame, text="AutoClick Settings", font=("Segoe UI", 13, "bold"))
-    title.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 16))
+    ttk.Label(frame, text="AutoClick Settings", font=("Segoe UI", 13, "bold")).grid(
+        row=0, column=0, columnspan=2, sticky="w", pady=(0, 16)
+    )
 
-    # Helper: a small description label rendered in gray below each control
     def _note(row: int, text: str) -> None:
-        ttk.Label(
-            frame,
-            text=text,
-            foreground="#888888",
-            font=("Segoe UI", 8),
-        ).grid(row=row, column=1, sticky="w", padx=(8, 0))
+        ttk.Label(frame, text=text, foreground="#888888", font=("Segoe UI", 8)).grid(
+            row=row, column=1, sticky="w", padx=(8, 0)
+        )
 
     # ----------------------------------------------------------------
-    # Row 1 – Active / Inactive toggle
+    # Row 1 - Active / Inactive toggle
     # ----------------------------------------------------------------
     active_var = tk.BooleanVar(value=config_manager.get_bool("autoClick", "active"))
 
     def _on_active_toggle() -> None:
-        """
-        Called whenever the checkbox changes. Persists the new state to
-        config and updates the service without requiring a restart.
-        """
         new_val = active_var.get()
         config_manager.set_config("autoClick", "active", str(new_val))
         if _service:
@@ -512,15 +452,35 @@ def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
 
     ttk.Label(frame, text="Enable AutoClick:").grid(row=1, column=0, sticky="w", pady=6)
     ttk.Checkbutton(
-        frame,
-        variable=active_var,
-        command=_on_active_toggle,
-        text="Active",
+        frame, variable=active_var, command=_on_active_toggle, text="Active"
     ).grid(row=1, column=1, sticky="w", padx=(8, 0))
     _note(2, "Toggleable at any time via the hotkey below.")
 
     # ----------------------------------------------------------------
-    # Row 3 – Activate key
+    # Wire hotkey -> GUI checkbox sync
+    # ----------------------------------------------------------------
+    def _sync_checkbox_from_hotkey(new_state: bool) -> None:
+        """Scheduled from any thread when hotkey fires; updates Tk checkbox safely."""
+        try:
+            if parent.winfo_exists():
+                parent.after(0, lambda s=new_state: _apply_state_to_checkbox(s))
+        except Exception:
+            log_error(_MOD, "Error scheduling checkbox sync.", exc_info=True)
+
+    def _apply_state_to_checkbox(new_state: bool) -> None:
+        """Runs on Tk main thread: sync checkbox to service state."""
+        try:
+            active_var.set(new_state)
+            config_manager.set_config("autoClick", "active", str(new_state))
+            log_debug(_MOD, "Checkbox synced from hotkey — active=%s.", new_state)
+        except Exception:
+            log_error(_MOD, "Error applying state to checkbox.", exc_info=True)
+
+    if _service:
+        _service.set_state_change_callback(_sync_checkbox_from_hotkey)
+
+    # ----------------------------------------------------------------
+    # Row 3 - Activate key
     # ----------------------------------------------------------------
     ttk.Label(frame, text="Hotkey:").grid(row=3, column=0, sticky="w", pady=6)
 
@@ -529,25 +489,21 @@ def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
     key_entry.grid(row=3, column=1, sticky="w", padx=(8, 0))
 
     def _on_key_change(*_) -> None:
-        """
-        Save the hotkey to config when the Entry loses focus or user presses
-        Enter, then re-register the hotkey with the service.
-        """
         new_key = key_var.get().strip()
         if not new_key:
             return
         config_manager.set_config("autoClick", "activate_key", new_key)
         if _service:
-            # Re-register by stopping and starting the service
             _service._unregister_hotkey()
             _service._register_hotkey()
+            log_info(_MOD, "Hotkey updated to: %s", new_key)
 
     key_entry.bind("<FocusOut>", _on_key_change)
     key_entry.bind("<Return>", _on_key_change)
     _note(4, "Press <Enter> or click away to apply the new hotkey.")
 
     # ----------------------------------------------------------------
-    # Row 5 – Milliseconds stopped before autoclick
+    # Row 5 - Milliseconds stopped before autoclick
     # ----------------------------------------------------------------
     ttk.Label(frame, text="Delay before click (ms):").grid(row=5, column=0, sticky="w", pady=6)
 
@@ -556,21 +512,20 @@ def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
     ms_spin.grid(row=5, column=1, sticky="w", padx=(8, 0))
 
     def _on_ms_change(*_) -> None:
-        """Persist the delay value whenever the spinbox changes."""
         try:
             val = int(ms_var.get())
-            val = max(50, min(2000, val))   # clamp to valid range
+            val = max(50, min(2000, val))
             config_manager.set_config("autoClick", "milliseconds_stopped", str(val))
         except (ValueError, tk.TclError):
-            pass  # ignore transient invalid states during typing
+            pass
 
     ms_spin.bind("<FocusOut>", _on_ms_change)
     ms_spin.bind("<Return>", _on_ms_change)
     ms_var.trace_add("write", _on_ms_change)
-    _note(6, "How long the cursor must be still before a click is triggered (50–2000 ms).")
+    _note(6, "How long the cursor must be still before a click is triggered (50-2000 ms).")
 
     # ----------------------------------------------------------------
-    # Row 7 – Pixels threshold
+    # Row 7 - Pixels threshold
     # ----------------------------------------------------------------
     ttk.Label(frame, text="Movement threshold (px):").grid(row=7, column=0, sticky="w", pady=6)
 
@@ -579,7 +534,6 @@ def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
     px_spin.grid(row=7, column=1, sticky="w", padx=(8, 0))
 
     def _on_px_change(*_) -> None:
-        """Persist the pixel threshold whenever the spinbox changes."""
         try:
             val = int(px_var.get())
             val = max(1, min(50, val))
@@ -590,20 +544,20 @@ def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
     px_spin.bind("<FocusOut>", _on_px_change)
     px_spin.bind("<Return>", _on_px_change)
     px_var.trace_add("write", _on_px_change)
-    _note(8, "Cursor movement below this distance (px) counts as 'still' (1–50 px).")
+    _note(8, "Cursor movement below this distance (px) counts as 'still' (1-50 px).")
 
     # ----------------------------------------------------------------
-    # Status bar at the bottom
+    # Status bar
     # ----------------------------------------------------------------
-    separator = ttk.Separator(frame, orient="horizontal")
-    separator.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(20, 8))
-
-    status_var = tk.StringVar(value="Service running." if _DEPS_AVAILABLE else
-                              "⚠ pynput/keyboard not installed – AutoClick disabled.")
+    ttk.Separator(frame, orient="horizontal").grid(
+        row=9, column=0, columnspan=2, sticky="ew", pady=(20, 8)
+    )
+    status_var = tk.StringVar(
+        value="Service running." if _DEPS_AVAILABLE else
+              "pynput/keyboard not installed - AutoClick disabled."
+    )
     ttk.Label(frame, textvariable=status_var, foreground="#555555",
               font=("Segoe UI", 9)).grid(row=10, column=0, columnspan=2, sticky="w")
 
-    # Make column 1 stretch so layout is tidy on resize
     frame.columnconfigure(1, weight=1)
-
     return frame

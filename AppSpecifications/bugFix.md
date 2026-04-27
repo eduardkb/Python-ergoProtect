@@ -50,6 +50,6 @@ After completing the changes, generate a new `.zip` file containing the updated 
     
 ==========================================
 Fix issues:
-  - in module AutoClick.py analyze the whole module and identify in what situation AutoClick.py is paused for 5 seconds. It is paused for 5 seconds very frequently. Fix this by only implementing this pause when the user initiates a manual drag/drop action and the left mouse button is hold for more than 500 milisseconds. make this pause last for 10 seconds and if any mouse button is pressed (not considering the autoclick) the wait is also cancelled.
-  - in module "RestReminder.py", only mouse clicks and keyboard interactions are considered keyboard and mouse usage. but just moving the mouse should also be considered an interaction and update the mouse time stamps. consider mouse interaction any mouse button click or any movement bigger than 10 pixels.
+- the previous bugs were fixed. however, it seems that now, because of a unknown reason, the whole keyboard got blocked. that should never happen.
+- when the autoclick feature is enabled (through keyboard key assigned or clicking the checkbox), the first autoclick should be ignored since the mouse did not move. just autoclick after the mouse has moved more than 5 pixels.
 ==========================================
