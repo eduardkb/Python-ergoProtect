@@ -499,11 +499,7 @@ class PauseScreen:
         self._remaining = rest_seconds
         self._closed    = False
 
-        self._kb_suppress    = None
-        self._mouse_suppress = None
-
         self._build_window()
-        self._install_input_capture()
         self._win.after(1000, self._tick)
 
     def _build_window(self):
@@ -538,7 +534,6 @@ class PauseScreen:
                 pass
 
         self._win.protocol("WM_DELETE_WINDOW", lambda: None)
-        self._win.grab_set()
         self._win.focus_force()
 
         BG      = "#1e3a5f"
@@ -629,55 +624,10 @@ class PauseScreen:
         self._update_countdown_label()
         self._win.after(1000, self._tick)
 
-    def _install_input_capture(self):
-        """Install pynput suppressing listeners."""
-        if not _PYNPUT_OK:
-            log_warning(_MOD, "pynput unavailable - input capture inactive.")
-            return
-        try:
-            self._kb_suppress = _pynput_kb.Listener(
-                on_press=self._swallow_key,
-                suppress=True,
-                daemon=True,
-            )
-            self._kb_suppress.start()
-            log_debug(_MOD, "Keyboard suppressing listener started.")
-        except Exception as exc:
-            log_error(_MOD, "Could not start keyboard suppressor: %s", exc, exc_info=True)
-        try:
-            self._mouse_suppress = _pynput_mouse.Listener(
-                on_click=self._swallow_click,
-                suppress=True,
-                daemon=True,
-            )
-            self._mouse_suppress.start()
-            log_debug(_MOD, "Mouse suppressing listener started.")
-        except Exception as exc:
-            log_error(_MOD, "Could not start mouse suppressor: %s", exc, exc_info=True)
-
-    def _swallow_key(self, key):
-        pass
-
-    def _swallow_click(self, x, y, button, pressed):
-        pass
-
-    def _release_input_capture(self):
-        """Stop the suppressing listeners and restore normal user control."""
-        for lst in (self._kb_suppress, self._mouse_suppress):
-            if lst:
-                try:
-                    lst.stop()
-                except Exception:
-                    pass
-        self._kb_suppress    = None
-        self._mouse_suppress = None
-        log_debug(_MOD, "Input capture released; user control restored.")
-
     def _btn_dismiss(self):
         if self._closed:
             return
         self._closed = True
-        self._release_input_capture()
         self._destroy_window()
         self._on_dismiss()
 
@@ -685,7 +635,6 @@ class PauseScreen:
         if self._closed:
             return
         self._closed = True
-        self._release_input_capture()
         self._destroy_window()
         self._on_postpone()
 
@@ -693,7 +642,6 @@ class PauseScreen:
         if self._closed:
             return
         self._closed = True
-        self._release_input_capture()
         self._destroy_window()
         self._on_elapsed()
 
@@ -702,14 +650,9 @@ class PauseScreen:
         if self._closed:
             return
         self._closed = True
-        self._release_input_capture()
         self._destroy_window()
 
     def _destroy_window(self):
-        try:
-            self._win.grab_release()
-        except Exception:
-            pass
         try:
             self._win.destroy()
         except Exception:

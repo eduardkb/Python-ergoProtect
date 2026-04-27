@@ -50,10 +50,6 @@ After completing the changes, generate a new `.zip` file containing the updated 
     
 ==========================================
 On Module RestReminder.py
-- Change all instances names of variable "continuous_work_minutes" to "continuous_work_limit_minutes" including writing it to the config.ini file.
-- Change all instances names of variable "rest_time_seconds" to "pause_time_minutes" including writing it to the config.ini file. and change all logic from seconds to minutes including inside variable "_RANGES"
-- Change all instances names of variable "delay_pause_minutes" to "pause_delay_minutes" including writing it to the config.ini file.
-- Change all instances names of variable "reset_of_work_time_minutes" to "clear_continuous_work_minutes" including writing it to the config.ini file.
-
-- considering variables on _RANGES after change above, do validations on the Rest Reminder tab so that user can't change the value on the text boxes out of the range (if a number is inserted out of range, a number in the range is automatically inserted after user leaves the field)
+- remove all logic that blocks mouse and keyboard input from the whole module.
+- mouse and keyboard movement or click or key press should not be blocked anymore at any time. not even during the pause screen. clicking and key presses should be allowed anywhere on windows apps on the background and or the pause screen. 
 ==========================================
