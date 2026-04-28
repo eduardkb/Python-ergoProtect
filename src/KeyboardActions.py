@@ -277,9 +277,9 @@ class KeyboardActionsService:
                         hook_alive, heartbeat_age,
                     )
                     self._restart_hooks()
-                else:
-                    log_debug(_MOD, "Watchdog: hook OK (listener_alive=%s, heartbeat_age=%.1fs).",
-                              hook_alive, heartbeat_age)
+                # else:
+                    # log_debug(_MOD, "Watchdog: hook OK (listener_alive=%s, heartbeat_age=%.1fs).",
+                    #          hook_alive, heartbeat_age)
             except Exception:
                 log_error(_MOD, "Watchdog loop encountered an unexpected error.", exc_info=True)
 
