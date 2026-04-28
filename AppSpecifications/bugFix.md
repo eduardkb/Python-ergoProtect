@@ -50,6 +50,7 @@ After completing the changes, generate a new `.zip` file containing the updated 
     
 ==========================================
 Fix issues:
-- the previous bugs were fixed. however, it seems that now, because of a unknown reason, the whole keyboard got blocked. that should never happen.
-- when the autoclick feature is enabled (through keyboard key assigned or clicking the checkbox), the first autoclick should be ignored since the mouse did not move. just autoclick after the mouse has moved more than 5 pixels.
+- Make it so that a double click on ergoProtect icon on tray opens the app's graphical interface directly. double clicking on tray icon now does nothing.
+- After the customer leaves the computer for a long time, the General Interaction timer appears counting from the last time it was reset. When customer is away for more than the "clear_continuous_work_minutes" the first time the mouse is moved, any mouse button is pressed or any key on keyboard is pressed, this timer should be reset again.
+- There should never be two of this applciations running at the same time. if user tries to start it twice, give a message and close the second started instance.
 ==========================================

@@ -158,6 +158,14 @@ class RestReminderService:
         self._pause_open = False
         self._pause_win  = None
 
+        # When the user has been away longer than clear_continuous_work_minutes,
+        # the idle-reset may not fire before the first new input event updates
+        # _last_activity (shrinking the measured idle time below the threshold).
+        # This flag is set by the monitor loop when it detects a long absence
+        # and cleared + acted upon by the first subsequent input event, ensuring
+        # the session timer is always reset after a long idle period.
+        self._needs_reset_on_activity = False
+
         # pynput listeners for activity tracking
         self._kb_listener    = None
         self._mouse_listener = None
@@ -291,12 +299,23 @@ class RestReminderService:
     # ------------------------------------------------------------------
 
     def _on_key_press(self, key):
-        """Update last_activity and last_kb_activity on any key press."""
+        """Update last_activity and last_kb_activity on any key press.
+
+        If the monitor loop detected a long idle period before this event
+        arrived, reset the session so the General Interaction timer starts
+        fresh from this first new input rather than from the stale timestamp.
+        """
         try:
             now = time.time()
             with self._lock:
                 self._last_activity    = now
                 self._last_kb_activity = now   # never reset, only updated here
+                needs_reset = self._needs_reset_on_activity
+                if needs_reset:
+                    self._needs_reset_on_activity = False
+            if needs_reset:
+                log_info(_MOD, "Session reset triggered by first key press after long idle.")
+                self._reset_session()
         except Exception as exc:
             log_error(_MOD, "_on_key_press error: %s", exc, exc_info=True)
 
@@ -309,6 +328,10 @@ class RestReminderService:
         are filtered out by a 20 ms heuristic: if the last keyboard event
         occurred within 20 ms before this mouse event, it is treated as
         synthetic and ignored.
+
+        If the monitor loop detected a long idle period before this event
+        arrived, the session is reset so the General Interaction timer starts
+        fresh from this first new input.
         """
         if not pressed:
             return
@@ -318,9 +341,16 @@ class RestReminderService:
                 last_kb = self._last_kb_activity
                 is_synthetic = (now - last_kb) < 0.020
             if not is_synthetic:
+                needs_reset = False
                 with self._lock:
                     self._last_activity       = now
                     self._last_mouse_activity = now   # never reset, only updated here
+                    needs_reset = self._needs_reset_on_activity
+                    if needs_reset:
+                        self._needs_reset_on_activity = False
+                if needs_reset:
+                    log_info(_MOD, "Session reset triggered by first mouse click after long idle.")
+                    self._reset_session()
         except Exception as exc:
             log_error(_MOD, "_on_mouse_click error: %s", exc, exc_info=True)
 
@@ -332,6 +362,10 @@ class RestReminderService:
         Counting movement as activity (not just clicks) gives a more accurate
         picture of user engagement and reduces false rest-break triggers when
         the user is actively moving the mouse between targets.
+
+        If the monitor loop detected a long idle period before this event
+        arrived, the session is reset so the General Interaction timer starts
+        fresh from this first new input.
         """
         try:
             prev = self._last_mouse_pos
@@ -341,11 +375,17 @@ class RestReminderService:
                 distance = math.sqrt(dx * dx + dy * dy)
                 if distance > 10:
                     now = time.time()
+                    needs_reset = False
                     with self._lock:
                         self._last_activity       = now
                         self._last_mouse_activity = now
+                        needs_reset = self._needs_reset_on_activity
+                        if needs_reset:
+                            self._needs_reset_on_activity = False
                     self._last_mouse_pos = (x, y)
-                    # log_debug(_MOD, "Mouse move >10px (%.1fpx) — activity updated.", distance)
+                    if needs_reset:
+                        log_info(_MOD, "Session reset triggered by first mouse move after long idle.")
+                        self._reset_session()
             else:
                 # First move event: record position without updating timestamps
                 self._last_mouse_pos = (x, y)
@@ -401,10 +441,19 @@ class RestReminderService:
         # 1. Idle reset: user has been away long enough -- start fresh session.
         #    Note: only usage_start and last_activity are reset; mouse/kb
         #    timestamps are preserved.
+        #
+        #    Two-phase approach:
+        #    a) If the user is still away (no input since the idle threshold was
+        #       crossed), reset immediately as before.
+        #    b) Set _needs_reset_on_activity so that if the first new input event
+        #       fires before the next poll (shrinking measured idle below threshold),
+        #       the session is still reset correctly on that first event.
         if idle_seconds > reset_threshold and not pause_open:
             log_info(_MOD,
                      "Idle reset triggered (idle=%.0fs >= threshold=%.0fs).",
                      idle_seconds, reset_threshold)
+            with self._lock:
+                self._needs_reset_on_activity = True
             self._reset_session()
             return
 

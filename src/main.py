@@ -36,6 +36,7 @@ import sys
 import os
 import threading
 import tkinter as tk
+import tkinter.messagebox as _msgbox
 
 # ---------------------------------------------------------------------------
 # Path helpers — must be resolved before any src.* imports
@@ -70,6 +71,64 @@ try:
 except ImportError:
     _TRAY_AVAILABLE = False
     print("[main] pystray/Pillow not installed – running without tray icon.")
+
+# ---------------------------------------------------------------------------
+# Single-instance enforcement
+# ---------------------------------------------------------------------------
+
+_LOCK_FILE_PATH: str = ""
+_LOCK_FILE_HANDLE = None  # kept open for the lifetime of the process
+
+def _acquire_single_instance_lock() -> bool:
+    """
+    Attempt to acquire an exclusive file lock to ensure only one instance of
+    ErgoProtect can run at a time.
+
+    On Windows we use msvcrt.locking(); on POSIX we use fcntl.flock().
+    Returns True if the lock was acquired (first instance), False otherwise.
+    """
+    global _LOCK_FILE_PATH, _LOCK_FILE_HANDLE
+
+    lock_dir = os.environ.get("TEMP") or os.environ.get("TMP") or os.path.expanduser("~")
+    _LOCK_FILE_PATH = os.path.join(lock_dir, "ergoprotect.lock")
+
+    try:
+        _LOCK_FILE_HANDLE = open(_LOCK_FILE_PATH, "w")
+        if sys.platform == "win32":
+            import msvcrt
+            msvcrt.locking(_LOCK_FILE_HANDLE.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(_LOCK_FILE_HANDLE, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _LOCK_FILE_HANDLE.write(str(os.getpid()))
+        _LOCK_FILE_HANDLE.flush()
+        return True
+    except (IOError, OSError):
+        if _LOCK_FILE_HANDLE:
+            try:
+                _LOCK_FILE_HANDLE.close()
+            except Exception:
+                pass
+            _LOCK_FILE_HANDLE = None
+        return False
+
+
+def _release_single_instance_lock() -> None:
+    """Release the file lock acquired by _acquire_single_instance_lock()."""
+    global _LOCK_FILE_HANDLE
+    if _LOCK_FILE_HANDLE:
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+                msvcrt.locking(_LOCK_FILE_HANDLE.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(_LOCK_FILE_HANDLE, fcntl.LOCK_UN)
+            _LOCK_FILE_HANDLE.close()
+        except Exception:
+            pass
+        _LOCK_FILE_HANDLE = None
+
 
 from src.generate_icon import make_icon as _make_icon
 from src.config_manager import ConfigManager
@@ -197,6 +256,20 @@ def main() -> None:
     Initialises all components and starts the event loop. The function
     returns (and the process exits) only when the user selects "Exit".
     """
+    # --- Single-instance guard ------------------------------------------
+    # Prevent two copies of ErgoProtect from running simultaneously.
+    if not _acquire_single_instance_lock():
+        # Show a brief message then exit immediately.
+        _tmp_root = tk.Tk()
+        _tmp_root.withdraw()
+        _msgbox.showwarning(
+            "ErgoProtect Already Running",
+            "ErgoProtect is already running.\n\n"
+            "You can find it in the system tray.",
+        )
+        _tmp_root.destroy()
+        sys.exit(0)
+
     # --- Config ---------------------------------------------------------
     config_manager = ConfigManager()
 
@@ -237,8 +310,17 @@ def main() -> None:
 
     # --- Tray icon ------------------------------------------------------
     if _TRAY_AVAILABLE:
+        # Marking the "Open ErgoProtect" item with default=True makes pystray
+        # invoke it automatically on a double-click on Windows (the OS activates
+        # the default menu item when the user double-clicks the tray icon).
+        # Setting default_action separately does NOT work reliably with all
+        # pystray backends — using the MenuItem default flag is the correct approach.
         menu = pystray.Menu(
-            pystray.MenuItem("Open ErgoProtect", lambda i, item: _on_open(i, item, gui)),
+            pystray.MenuItem(
+                "Open ErgoProtect",
+                lambda i, item: _on_open(i, item, gui),
+                default=True,
+            ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Exit", lambda i, item: _on_exit(i, item, gui)),
         )
@@ -249,10 +331,6 @@ def main() -> None:
             title="ErgoProtect",
             menu=menu,
         )
-
-        # Double-clicking the tray icon opens the GUI.
-        # pystray fires the default_action on a double-click on Windows.
-        tray_icon.default_action = lambda i, item: _on_open(i, item, gui)
 
         # Run the tray icon in a daemon thread so it doesn't block mainloop()
         tray_thread = threading.Thread(
@@ -271,6 +349,7 @@ def main() -> None:
     # --- Tkinter event loop (main thread) --------------------------------
     # mainloop() blocks here until the root window is destroyed (by _shutdown).
     gui.root.mainloop()
+    _release_single_instance_lock()
     log_info("main", "ErgoProtect exited cleanly.")
 
 
