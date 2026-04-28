@@ -50,7 +50,5 @@ After completing the changes, generate a new `.zip` file containing the updated 
     
 ==========================================
 Fix issues:
-- Make it so that a double click on ergoProtect icon on tray opens the app's graphical interface directly. double clicking on tray icon now does nothing.
-- After the customer leaves the computer for a long time, the General Interaction timer appears counting from the last time it was reset. When customer is away for more than the "clear_continuous_work_minutes" the first time the mouse is moved, any mouse button is pressed or any key on keyboard is pressed, this timer should be reset again.
-- There should never be two of this applciations running at the same time. if user tries to start it twice, give a message and close the second started instance.
+- KeyboardActions module frequently freezes without any warning or error. When it is reactivated (on GUI un-checking the "Active" checkbox and checking it again) it works again. after I stop and re-start this service, the following warning message appears: "2026-04-28 11:50:07.968,KeyboardActions,WARNING,Service thread was dead — performing clean restart. Find out why and correct.
 ==========================================

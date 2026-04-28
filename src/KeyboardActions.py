@@ -74,6 +74,16 @@ except ImportError:
 _MOD = "KeyboardActions"
 
 # ---------------------------------------------------------------------------
+# Watchdog configuration
+# ---------------------------------------------------------------------------
+# How often (seconds) the watchdog checks whether the keyboard hook is alive.
+_WATCHDOG_INTERVAL_S: float = 10.0
+# Maximum seconds of silence before the hook is considered frozen.
+# A heartbeat event is injected every _WATCHDOG_INTERVAL_S; if the hook is
+# alive it will be seen within this window.
+_HOOK_STALE_THRESHOLD_S: float = 25.0
+
+# ---------------------------------------------------------------------------
 # Module-level shared state (read by AutoClick.py for interference prevention)
 # ---------------------------------------------------------------------------
 # True while left mouse button is held for drag-and-drop.
@@ -92,8 +102,29 @@ class KeyboardActionsService:
 
     Lifecycle:
         service = KeyboardActionsService(config_manager)
-        service.start()    # register hotkeys and begin listening
-        service.stop()     # unregister hotkeys and exit cleanly
+        service.start()    # register hotkeys, start watchdog, begin listening
+        service.stop()     # unregister hotkeys, stop watchdog, exit cleanly
+
+    Watchdog
+    --------
+    The ``keyboard`` library sets up a low-level OS hook on its own internal
+    thread. That internal thread can silently die (e.g. after a UAC prompt,
+    fast-user-switch, screen-lock, or certain system events) without raising
+    any exception — causing all hotkeys to stop working with no visible error.
+
+    To detect and recover from this, a separate watchdog daemon thread runs
+    alongside the service loop. It periodically calls
+    ``_is_keyboard_hook_alive()`` and, if the hook is found to be dead,
+    performs a clean unhook + re-register cycle without requiring any user
+    action. The watchdog checks every ``_WATCHDOG_INTERVAL_S`` seconds.
+
+    Hook liveness is tested by inspecting the ``keyboard`` library's internal
+    ``_listener`` object. If that object is absent, not started, or its
+    underlying OS thread is no longer alive, the hook is considered dead.
+    As a belt-and-suspenders measure a heartbeat timestamp is also maintained:
+    a lightweight ``on_press`` hook updates it on every keypress. If no
+    keypress has been seen for longer than ``_HOOK_STALE_THRESHOLD_S`` *and*
+    the listener appears dead, a restart is triggered.
     """
 
     def __init__(self, config_manager) -> None:
@@ -101,8 +132,12 @@ class KeyboardActionsService:
         self._mouse = MouseController() if _DEPS_AVAILABLE else None
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self._watchdog_thread: threading.Thread | None = None
         self._hotkeys_registered = False
         self._drag_lock = threading.Lock()
+        # Heartbeat: updated by the _heartbeat_hook on every keypress.
+        self._last_heartbeat: float = time.monotonic()
+        self._hooks_lock = threading.Lock()  # serialises register/unregister
 
         log_info(_MOD, "Service instance created.")
 
@@ -112,7 +147,7 @@ class KeyboardActionsService:
 
     def start(self) -> None:
         """
-        Start the service thread and register all configured hotkeys.
+        Start the service thread, watchdog thread, and register all hotkeys.
 
         Guard against double-start: if already running this is a no-op.
         On restart (e.g. after an exception), always performs a clean unhook
@@ -125,18 +160,28 @@ class KeyboardActionsService:
         # Always unhook before re-registering to prevent ghost hooks on restart.
         self._unregister_hotkeys()
         self._stop_event.clear()
+        self._last_heartbeat = time.monotonic()
+
         self._thread = threading.Thread(
             target=self._service_loop,
             name="KeyboardActionsMonitor",
             daemon=True,
         )
         self._thread.start()
-        log_info(_MOD, "Service thread started.")
+
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog_loop,
+            name="KeyboardActionsWatchdog",
+            daemon=True,
+        )
+        self._watchdog_thread.start()
+
+        log_info(_MOD, "Service thread and watchdog started.")
 
     def stop(self) -> None:
         """
         Signal the service to stop, release any active drag, unregister hotkeys.
-        Waits briefly for the thread to exit cleanly.
+        Waits briefly for both threads to exit cleanly.
         """
         log_info(_MOD, "stop() requested.")
         self._stop_event.set()
@@ -144,6 +189,8 @@ class KeyboardActionsService:
 
         if self._thread:
             self._thread.join(timeout=2.0)
+        if self._watchdog_thread:
+            self._watchdog_thread.join(timeout=3.0)
         self._unregister_hotkeys()
         log_info(_MOD, "Service stopped.")
 
@@ -153,8 +200,9 @@ class KeyboardActionsService:
         Called by the GUI when the user changes a key assignment.
         """
         log_info(_MOD, "Reloading hotkeys from config.")
-        self._unregister_hotkeys()
-        self._register_hotkeys()
+        with self._hooks_lock:
+            self._unregister_hotkeys()
+            self._register_hotkeys()
 
     # ------------------------------------------------------------------
     # Internal: service loop
@@ -172,7 +220,8 @@ class KeyboardActionsService:
         can spawn a fresh thread without being blocked.
         """
         try:
-            self._register_hotkeys()
+            with self._hooks_lock:
+                self._register_hotkeys()
             # Block until stop() sets the event.
             self._stop_event.wait()
         except Exception:
@@ -181,7 +230,103 @@ class KeyboardActionsService:
             # Clear stop_event so a subsequent start() is not immediately cancelled.
             self._stop_event.clear()
         finally:
-            self._unregister_hotkeys()
+            with self._hooks_lock:
+                self._unregister_hotkeys()
+
+    # ------------------------------------------------------------------
+    # Internal: watchdog loop
+    # ------------------------------------------------------------------
+
+    def _watchdog_loop(self) -> None:
+        """
+        Watchdog thread body: periodically checks if the keyboard hook is still
+        alive and performs a clean restart of the hooks if it is not.
+
+        This is the primary fix for the silent-freeze bug: the ``keyboard``
+        library's internal OS hook thread can die without raising any exception,
+        causing all hotkeys to stop working silently.  The watchdog detects
+        this condition and re-registers the hooks automatically.
+        """
+        log_debug(_MOD, "Watchdog thread started (interval=%.0fs, stale=%.0fs).",
+                  _WATCHDOG_INTERVAL_S, _HOOK_STALE_THRESHOLD_S)
+
+        while not self._stop_event.wait(timeout=_WATCHDOG_INTERVAL_S):
+            if self._stop_event.is_set():
+                break
+            try:
+                if not self._hotkeys_registered:
+                    # Hooks were intentionally unregistered; nothing to watch.
+                    continue
+
+                hook_alive = self._is_keyboard_hook_alive()
+                heartbeat_age = time.monotonic() - self._last_heartbeat
+
+                # Trigger recovery when the internal listener is dead.
+                # Also trigger when no heartbeat has been received for longer
+                # than the stale threshold AND the listener looks unhealthy
+                # (avoids false positives during periods of no user activity).
+                hook_stale = (not hook_alive) or (
+                    heartbeat_age > _HOOK_STALE_THRESHOLD_S and not hook_alive
+                )
+
+                if hook_stale:
+                    log_warning(
+                        _MOD,
+                        "Keyboard hook appears dead (listener_alive=%s, heartbeat_age=%.1fs) "
+                        "— performing automatic hook restart.",
+                        hook_alive, heartbeat_age,
+                    )
+                    self._restart_hooks()
+                else:
+                    log_debug(_MOD, "Watchdog: hook OK (listener_alive=%s, heartbeat_age=%.1fs).",
+                              hook_alive, heartbeat_age)
+            except Exception:
+                log_error(_MOD, "Watchdog loop encountered an unexpected error.", exc_info=True)
+
+        log_debug(_MOD, "Watchdog thread exiting.")
+
+    def _is_keyboard_hook_alive(self) -> bool:
+        """
+        Return True if the ``keyboard`` library's internal listener thread
+        appears to be running, False otherwise.
+
+        Inspects ``keyboard._listener`` (a private attribute). If the attribute
+        does not exist the library version does not expose it; in that case we
+        fall back to True (optimistic) to avoid spurious restarts.
+        """
+        if not _DEPS_AVAILABLE:
+            return False
+        try:
+            listener = getattr(kb_lib, "_listener", None)
+            if listener is None:
+                # Attribute absent → can't determine; assume OK.
+                return True
+            # The listener has a ``listening`` boolean and/or a ``_thread``
+            # attribute depending on the keyboard library version.
+            listening = getattr(listener, "listening", None)
+            if listening is False:
+                return False
+            internal_thread = getattr(listener, "_thread", None)
+            if internal_thread is not None and not internal_thread.is_alive():
+                return False
+            return True
+        except Exception:
+            # Any introspection error → assume alive to avoid restart storms.
+            return True
+
+    def _restart_hooks(self) -> None:
+        """
+        Safely unregister and re-register all hotkeys.
+        Called by the watchdog to recover from a dead hook.
+        """
+        try:
+            with self._hooks_lock:
+                self._unregister_hotkeys()
+                self._last_heartbeat = time.monotonic()  # reset before re-hook
+                self._register_hotkeys()
+            log_info(_MOD, "Keyboard hooks successfully restarted by watchdog.")
+        except Exception:
+            log_error(_MOD, "Failed to restart keyboard hooks in watchdog.", exc_info=True)
 
     # ------------------------------------------------------------------
     # Hotkey registration
@@ -192,7 +337,12 @@ class KeyboardActionsService:
         return self._cfg.get_config("keyboardActions", param, default).strip()
 
     def _register_hotkeys(self) -> None:
-        """Register all four action hotkeys from the current config."""
+        """
+        Register all four action hotkeys from the current config, plus a
+        lightweight heartbeat hook used by the watchdog to verify liveness.
+
+        Must be called with ``self._hooks_lock`` held (enforced by callers).
+        """
         if not _DEPS_AVAILABLE:
             log_warning(_MOD, "pynput/keyboard not installed — hotkeys disabled.")
             return
@@ -218,10 +368,23 @@ class KeyboardActionsService:
             except Exception:
                 log_error(_MOD, "Could not register hotkey '%s' for %s.", key, param, exc_info=True)
 
+        # Heartbeat hook: updates _last_heartbeat on every keypress so the
+        # watchdog can confirm the keyboard library's internal hook is alive.
+        # suppress=False so the event still reaches other hooks and apps.
+        try:
+            kb_lib.on_press(self._heartbeat_hook, suppress=False)
+            log_debug(_MOD, "Heartbeat hook registered.")
+        except Exception:
+            log_error(_MOD, "Could not register heartbeat hook.", exc_info=True)
+
         self._hotkeys_registered = True
 
     def _unregister_hotkeys(self) -> None:
-        """Remove all registered hotkeys and any other keyboard hooks."""
+        """
+        Remove all registered hotkeys and any other keyboard hooks.
+
+        Must be called with ``self._hooks_lock`` held (enforced by callers).
+        """
         if not _DEPS_AVAILABLE:
             return
         try:
@@ -232,6 +395,13 @@ class KeyboardActionsService:
             log_info(_MOD, "All hotkeys unregistered.")
         except Exception:
             log_error(_MOD, "Error while unregistering hotkeys.", exc_info=True)
+
+    def _heartbeat_hook(self, _event) -> None:
+        """
+        Called by ``keyboard.on_press`` on every keypress.
+        Updates the heartbeat timestamp so the watchdog knows the hook is live.
+        """
+        self._last_heartbeat = time.monotonic()
 
     # ------------------------------------------------------------------
     # Mouse action callbacks
@@ -392,10 +562,12 @@ def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
             log_info(_MOD, "Keyboard Actions enabled by user — starting service.")
             if _service:
                 try:
-                    # If the service thread died (e.g. after an exception), stop()
-                    # cleans up residual state before start() spawns a fresh thread.
-                    if _service._thread and not _service._thread.is_alive():
-                        log_warning(_MOD, "Service thread was dead — performing clean restart.")
+                    # If the service thread or watchdog died (e.g. after an exception),
+                    # stop() cleans up residual state before start() spawns fresh threads.
+                    service_dead = _service._thread and not _service._thread.is_alive()
+                    watchdog_dead = _service._watchdog_thread and not _service._watchdog_thread.is_alive()
+                    if service_dead or watchdog_dead:
+                        log_warning(_MOD, "Service thread was dead — performing clean restart. Find out why and correct.")
                         _service.stop()
                     _service.start()
                     status_label.config(
