@@ -75,8 +75,12 @@ from src.generate_icon import make_icon as _make_icon
 from src.config_manager import ConfigManager
 from src.AppLogging import init_logging, cleanup_old_logs, log_info, log_error, shutdown_logging
 from src.GraphicalInterface import GraphicalInterface
-from src import AutoClick  # imported to access the module-level service
 
+from src import AutoClick
+from src import RestReminder
+from src import KeyboardActions
+from src import UsageGraphics
+from src import UsageLog
 
 # ---------------------------------------------------------------------------
 # Icon helpers
