@@ -1,6 +1,7 @@
 ## Task Overview
 Analyze the existing project files (provided as a `.zip`). Apply the required modifications described in the **“Bug Fix Instructions”** section to the Python code.
-Be as efficient as possible writing code to use as few AI resources as possible
+Be as efficient as possible writing code to use as few AI resources as possible.
+If you need more than 2 tries to identify the problem, stop the reasoning to solve the problem.
 After completing the changes, generate a new `.zip` file containing the updated code.
 
 ---
@@ -50,6 +51,5 @@ After completing the changes, generate a new `.zip` file containing the updated 
     
 ==========================================
 Fix issues:
-- KeyboardActions module still frequently freezes without any warning or error. When it is reactivated (on GUI un-checking the "Active" checkbox and checking it again) sometimes it works after restart, sometimes not. After it stops, I am getting lots of these log messages: "2026-04-29 18:02:35.910,AutoClick,DEBUG,Mouse position unavailable — skipping tick.". Today it froze completely (restarting thread did not work) after PC came back from hibernation.
-- ALso, the key to activate / deactivate the auto click function is not working at all. It dos not enable/disable the feature and also does not check/uncheck the "active" button on the GUI. Make the key (F6 default) be exclusively mapped to the ergoProtect application. now, it is still doing actions on other windows apps or on windows itself.
+- Autoclick freezing issue. Ressetting the autoclick thread does not restore it to work. On log, I see messages "2026-04-30 09:10:25.228,AutoClick,DEBUG,"AutoClick suppressed — awaiting first move, drag, or cooldown." When autoclick stops working. It is possible that after some Keyboard Actions module interactions, the auto click module does not identify mouse movement anymore.
 ==========================================
