@@ -54,6 +54,9 @@ _POST_DRAG_COOLDOWN_S = 10.0
 _MANUAL_DRAG_THRESHOLD_S = 0.5
 _POST_ACTIVATION_COOLDOWN_S = 1.0
 
+# Watchdog: how often to check if the monitor thread is alive after hibernation.
+_WATCHDOG_INTERVAL_S: float = 10.0
+
 # ---------------------------------------------------------------------------
 # Module-level timing state
 # ---------------------------------------------------------------------------
@@ -72,10 +75,15 @@ class AutoClickService:
         self._cfg = config_manager
         self._active = config_manager.get_bool("autoClick", "active", False)
         self._thread: threading.Thread | None = None
+        self._watchdog_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
         self._mouse = MouseController() if _DEPS_AVAILABLE else None
-        self._hotkey_registered = False
+
+        # Each start() registers exactly one hotkey callback stored here so we
+        # can remove it selectively via keyboard.remove_hotkey() without calling
+        # unhook_all_hotkeys(), which would wipe KeyboardActions hooks too.
+        self._hotkey_handler = None
         self._hotkey_key: str = ""
 
         # Timestamp of last activation for post-activation cooldown.
@@ -101,16 +109,24 @@ class AutoClickService:
         self._on_state_change_cb = cb
 
     def start(self) -> None:
-        """Start the monitoring thread, drag listener, and exclusive hotkey."""
+        """Start the monitoring thread, watchdog, drag listener, and exclusive hotkey."""
         if self._thread and self._thread.is_alive():
             return
+        # Clean up any previous resources before re-starting.
         self._unregister_hotkey()
         self._stop_mouse_listener()
         self._stop_event.clear()
+
         self._thread = threading.Thread(
             target=self._monitor_loop, name="AutoClickMonitor", daemon=True
         )
         self._thread.start()
+
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog_loop, name="AutoClickWatchdog", daemon=True
+        )
+        self._watchdog_thread.start()
+
         self._register_hotkey()
         self._start_mouse_listener()
         log_info(_MOD, "AutoClick service started.")
@@ -120,6 +136,8 @@ class AutoClickService:
         self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=1.0)
+        if self._watchdog_thread:
+            self._watchdog_thread.join(timeout=2.0)
         self._unregister_hotkey()
         self._stop_mouse_listener()
         log_info(_MOD, "AutoClick service stopped.")
@@ -176,45 +194,109 @@ class AutoClickService:
 
     def _register_hotkey(self) -> None:
         """
-        Register an exclusive per-key hotkey using keyboard.block_key() and
-        keyboard.add_hotkey().
+        Register an exclusive suppressed hotkey for the activate/deactivate key.
 
-        keyboard.block_key() suppresses only the configured key at the OS
-        driver level so it never reaches other applications. No other keys
-        are affected and no re-injection feedback loop is created.
+        Uses keyboard.add_hotkey() with suppress=True so the key event is fully
+        consumed by ErgoProtect and never forwarded to the currently focused
+        application or Windows itself. This makes F6 (default) exclusive to
+        ErgoProtect regardless of what other application is in the foreground.
 
-        NOTE: The previous approach (pynput Listener with suppress=True and
-        re-injecting all other keys via a Controller) caused a full keyboard
-        lockup because the re-injected events were intercepted again by the
-        same suppressing listener, creating an infinite loop.
+        We do NOT use block_key() because it interacts poorly with the hotkey
+        re-registration cycle after hibernation. suppress=True on add_hotkey()
+        is the correct and sufficient mechanism for exclusive key capture.
+
+        The handler reference is stored so it can be removed selectively via
+        keyboard.remove_hotkey(), avoiding any impact on KeyboardActions hooks.
         """
-        if not _DEPS_AVAILABLE or self._hotkey_registered:
+        if not _DEPS_AVAILABLE or self._hotkey_handler is not None:
             return
         key = self._cfg.get_config("autoClick", "activate_key", "F6")
         try:
-            kb_lib.block_key(key)
-            kb_lib.add_hotkey(key, self.toggle, suppress=True)
-            self._hotkey_registered = True
+            # suppress=True: the keystroke is consumed exclusively by ErgoProtect
+            # and is NOT passed to any other window, application, or Windows itself.
+            self._hotkey_handler = kb_lib.add_hotkey(key, self.toggle, suppress=True)
             self._hotkey_key = key
-            log_info(_MOD, "Exclusive hotkey registered (block_key) for key: %s", key)
+            log_info(_MOD, "Exclusive hotkey registered (suppress=True) for key: %s", key)
         except Exception:
+            self._hotkey_handler = None
             log_error(_MOD, "Could not register hotkey '%s'.", key, exc_info=True)
 
     def _unregister_hotkey(self) -> None:
-        """Remove the blocked key and hotkey callback."""
-        if not self._hotkey_registered:
+        """
+        Remove only this module's hotkey callback, leaving all other hooks intact.
+
+        Uses keyboard.remove_hotkey() with the stored handler reference instead
+        of unhook_all_hotkeys(), which would incorrectly remove the hotkeys
+        registered by the KeyboardActions module as a side effect.
+        """
+        if self._hotkey_handler is None:
             return
         try:
-            kb_lib.unhook_all_hotkeys()
-            if self._hotkey_key:
-                try:
-                    kb_lib.unblock_key(self._hotkey_key)
-                except Exception:
-                    pass
+            kb_lib.remove_hotkey(self._hotkey_handler)
+            log_info(_MOD, "Hotkey '%s' unregistered.", self._hotkey_key)
         except Exception:
-            pass
-        self._hotkey_registered = False
-        log_info(_MOD, "Hotkey unregistered.")
+            # Handler may already be gone (e.g. after hibernation hook reset).
+            log_debug(_MOD, "remove_hotkey() failed (may already be removed): %s", self._hotkey_key)
+        finally:
+            self._hotkey_handler = None
+            self._hotkey_key = ""
+
+    # ------------------------------------------------------------------
+    # Watchdog loop — detects dead monitor thread (e.g. after hibernation)
+    # ------------------------------------------------------------------
+
+    def _watchdog_loop(self) -> None:
+        """
+        Periodically checks whether the monitor thread is alive.
+
+        After the PC resumes from hibernation, the keyboard library's internal
+        OS hook thread can die silently, and the pynput mouse controller may
+        become unusable. This watchdog detects a dead monitor thread and
+        performs a clean restart: re-creates the mouse controller (to recover
+        from the hibernation-induced pynput failure), and re-registers everything.
+
+        The watchdog only attempts recovery when stop_event is not set (i.e.
+        when the service has not been intentionally stopped by the user).
+        """
+        log_debug(_MOD, "Watchdog thread started (interval=%.0fs).", _WATCHDOG_INTERVAL_S)
+
+        while not self._stop_event.wait(timeout=_WATCHDOG_INTERVAL_S):
+            if self._stop_event.is_set():
+                break
+            try:
+                thread_dead = self._thread is None or not self._thread.is_alive()
+                if not thread_dead:
+                    continue  # monitor thread is healthy
+
+                log_warning(
+                    _MOD,
+                    "Monitor thread found dead by watchdog (post-hibernation?) — restarting.",
+                )
+                # Re-create the mouse controller: after hibernation pynput's
+                # internal state can be invalid; a fresh instance recovers it.
+                try:
+                    self._mouse = MouseController()
+                except Exception:
+                    log_error(_MOD, "Could not re-create MouseController in watchdog.", exc_info=True)
+
+                # Full restart: clean unregister + fresh thread + re-register.
+                self._unregister_hotkey()
+                self._stop_mouse_listener()
+                self._stop_event.clear()
+
+                self._thread = threading.Thread(
+                    target=self._monitor_loop, name="AutoClickMonitor", daemon=True
+                )
+                self._thread.start()
+
+                self._register_hotkey()
+                self._start_mouse_listener()
+                log_info(_MOD, "Monitor thread successfully restarted by watchdog.")
+
+            except Exception:
+                log_error(_MOD, "Watchdog encountered an unexpected error.", exc_info=True)
+
+        log_debug(_MOD, "Watchdog thread exiting.")
 
     # ------------------------------------------------------------------
     # Manual drag listener
@@ -337,9 +419,17 @@ class AutoClickService:
                 px_threshold = self._cfg.get_int("autoClick", "pixels_threshold", 5)
                 seconds_stopped = ms_stopped / 1000.0
 
-                pos = self._mouse.position
+                try:
+                    pos = self._mouse.position
+                except Exception:
+                    # pynput mouse controller can fail after hibernation; exit
+                    # so the watchdog detects a dead thread and restarts cleanly.
+                    log_warning(_MOD, "Mouse position read failed — exiting monitor loop for watchdog restart.")
+                    return
+
                 if pos is None:
-                    log_debug(_MOD, "Mouse position unavailable — skipping tick.")
+                    # Position transiently unavailable (e.g. during display switch).
+                    # Reset tracking state silently; do not log on every tick.
                     last_x, last_y = None, None
                     still_since = None
                     _click_fired = False
@@ -386,7 +476,7 @@ class AutoClickService:
         try:
             self._mouse.press(Button.left)
             self._mouse.release(Button.left)
-            log_debug(_MOD, "AutoClick fired.")
+            # log_debug(_MOD, "AutoClick fired.")
         except Exception:
             log_error(_MOD, "AutoClick click failed.", exc_info=True)
 
@@ -398,8 +488,9 @@ class AutoClickService:
         except Exception:
             pass
         self._active = self._cfg.get_bool("autoClick", "active", False)
-        self._stop_event.clear()
-        log_info(_MOD, "AutoClick recovered from exception — ready for restart.")
+        # Do NOT clear stop_event here — the watchdog will detect the dead
+        # thread and perform a full restart including clearing stop_event.
+        log_info(_MOD, "AutoClick recovered from exception — watchdog will restart thread.")
 
 
 # ---------------------------------------------------------------------------
@@ -460,16 +551,24 @@ def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
     # Wire hotkey -> GUI checkbox sync
     # ----------------------------------------------------------------
     def _sync_checkbox_from_hotkey(new_state: bool) -> None:
-        """Scheduled from any thread when hotkey fires; updates Tk checkbox safely."""
+        """
+        Called from the keyboard lib's internal thread when the hotkey fires.
+        Marshals the state update safely onto the Tkinter main thread via after().
+        The winfo_exists() check is deferred to the Tk thread — calling it from
+        a non-Tk thread is a race condition that can crash Tk on some platforms.
+        """
         try:
-            if parent.winfo_exists():
-                parent.after(0, lambda s=new_state: _apply_state_to_checkbox(s))
+            # after() is thread-safe in Tkinter and posts the callback to the
+            # main event loop without touching any Tk widget from this thread.
+            parent.after(0, lambda s=new_state: _apply_state_to_checkbox(s))
         except Exception:
             log_error(_MOD, "Error scheduling checkbox sync.", exc_info=True)
 
     def _apply_state_to_checkbox(new_state: bool) -> None:
         """Runs on Tk main thread: sync checkbox to service state."""
         try:
+            if not parent.winfo_exists():
+                return
             active_var.set(new_state)
             config_manager.set_config("autoClick", "active", str(new_state))
             log_debug(_MOD, "Checkbox synced from hotkey — active=%s.", new_state)

@@ -139,6 +139,13 @@ class KeyboardActionsService:
         self._last_heartbeat: float = time.monotonic()
         self._hooks_lock = threading.Lock()  # serialises register/unregister
 
+        # Individual handler references returned by add_hotkey() / on_press().
+        # Stored so we can remove each one selectively with remove_hotkey() /
+        # unhook(), instead of calling unhook_all() which would also remove the
+        # AutoClick module's F6 hotkey as an unintended side effect.
+        self._hotkey_handlers: list = []
+        self._heartbeat_hook_ref = None
+
         log_info(_MOD, "Service instance created.")
 
     # ------------------------------------------------------------------
@@ -317,12 +324,22 @@ class KeyboardActionsService:
     def _restart_hooks(self) -> None:
         """
         Safely unregister and re-register all hotkeys.
-        Called by the watchdog to recover from a dead hook.
+        Called by the watchdog to recover from a dead hook (e.g. after hibernation).
+
+        Re-creates the MouseController to recover from any pynput state that
+        became invalid while the OS was suspended during hibernation.
         """
         try:
             with self._hooks_lock:
                 self._unregister_hotkeys()
                 self._last_heartbeat = time.monotonic()  # reset before re-hook
+                # Re-create mouse controller: pynput state can become invalid
+                # after the OS resumes from hibernation or a fast-user-switch.
+                try:
+                    if _DEPS_AVAILABLE:
+                        self._mouse = MouseController()
+                except Exception:
+                    log_error(_MOD, "Could not re-create MouseController in watchdog restart.", exc_info=True)
                 self._register_hotkeys()
             log_info(_MOD, "Keyboard hooks successfully restarted by watchdog.")
         except Exception:
@@ -340,6 +357,11 @@ class KeyboardActionsService:
         """
         Register all four action hotkeys from the current config, plus a
         lightweight heartbeat hook used by the watchdog to verify liveness.
+
+        Each hotkey handler reference is stored in self._hotkey_handlers so
+        that _unregister_hotkeys() can remove them individually via
+        remove_hotkey(). This avoids calling unhook_all() which would also
+        remove the AutoClick module's F6 hotkey as a destructive side effect.
 
         Must be called with ``self._hooks_lock`` held (enforced by callers).
         """
@@ -363,7 +385,8 @@ class KeyboardActionsService:
                 # and is NOT passed through to the currently focused application.
                 # This prevents apps like MS Excel (F7=spell check), VS Code
                 # (F8=next error), etc. from also acting on the same keystroke.
-                kb_lib.add_hotkey(key, callback, suppress=True)
+                handler = kb_lib.add_hotkey(key, callback, suppress=True)
+                self._hotkey_handlers.append(handler)
                 log_info(_MOD, "Hotkey registered: %s → %s()", key, callback.__name__)
             except Exception:
                 log_error(_MOD, "Could not register hotkey '%s' for %s.", key, param, exc_info=True)
@@ -372,7 +395,7 @@ class KeyboardActionsService:
         # watchdog can confirm the keyboard library's internal hook is alive.
         # suppress=False so the event still reaches other hooks and apps.
         try:
-            kb_lib.on_press(self._heartbeat_hook, suppress=False)
+            self._heartbeat_hook_ref = kb_lib.on_press(self._heartbeat_hook, suppress=False)
             log_debug(_MOD, "Heartbeat hook registered.")
         except Exception:
             log_error(_MOD, "Could not register heartbeat hook.", exc_info=True)
@@ -381,20 +404,37 @@ class KeyboardActionsService:
 
     def _unregister_hotkeys(self) -> None:
         """
-        Remove all registered hotkeys and any other keyboard hooks.
+        Remove all hotkeys and hooks registered by this module.
+
+        Uses targeted remove_hotkey() / unhook() calls on the stored handler
+        references instead of unhook_all(). This is critical: unhook_all()
+        would also remove the AutoClick module's F6 hotkey and any other hooks
+        registered by other parts of the application, causing them to silently
+        stop working.
 
         Must be called with ``self._hooks_lock`` held (enforced by callers).
         """
         if not _DEPS_AVAILABLE:
             return
-        try:
-            # unhook_all removes hotkeys AND any on_press/on_release hooks,
-            # which prevents ghost hooks after restart.
-            kb_lib.unhook_all()
-            self._hotkeys_registered = False
-            log_info(_MOD, "All hotkeys unregistered.")
-        except Exception:
-            log_error(_MOD, "Error while unregistering hotkeys.", exc_info=True)
+
+        # Remove each action hotkey individually.
+        for handler in self._hotkey_handlers:
+            try:
+                kb_lib.remove_hotkey(handler)
+            except Exception:
+                pass  # Already removed (e.g. after hibernation hook reset).
+        self._hotkey_handlers.clear()
+
+        # Remove the heartbeat on_press hook.
+        if self._heartbeat_hook_ref is not None:
+            try:
+                kb_lib.unhook(self._heartbeat_hook_ref)
+            except Exception:
+                pass
+            self._heartbeat_hook_ref = None
+
+        self._hotkeys_registered = False
+        log_info(_MOD, "All hotkeys unregistered.")
 
     def _heartbeat_hook(self, _event) -> None:
         """
