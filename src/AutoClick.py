@@ -386,8 +386,7 @@ class AutoClickService:
         still_since: float | None = None
         _click_fired: bool = False
         _FIRST_MOVE_PX = 5  # pixels required to satisfy first-move requirement
-        _last_successful_update: float = 0.0  # timestamp of last position update
-        _STATE_RESET_TIMEOUT_S = 5.0  # reset tracking if no position update for this long
+        _last_successful_update: float = 0.0  # timestamp of last position read (for logging only)
 
         def _is_blocked() -> bool:
             now = time.monotonic()
@@ -452,12 +451,16 @@ class AutoClickService:
 
                 distance = math.sqrt((cur_x - last_x) ** 2 + (cur_y - last_y) ** 2)
 
+                # Always update the successful-update timestamp on every valid position read.
+                # This prevents the stale-state watchdog from triggering when the mouse
+                # is genuinely still and blocked (e.g. awaiting first-move after activation).
+                _last_successful_update = now
+
                 if distance > px_threshold:
                     last_x, last_y = cur_x, cur_y
                     still_since = now
                     _click_fired = False
-                    _last_successful_update = now
-                    # Satisfy the first-move requirement once cursor moves >5px.
+                    # Satisfy the first-move requirement once cursor moves enough pixels.
                     if not self._moved_since_activation and distance > _FIRST_MOVE_PX:
                         self._moved_since_activation = True
                         log_debug(_MOD, "First move detected after activation — autoclick now permitted.")
@@ -466,21 +469,11 @@ class AutoClickService:
                     if elapsed >= seconds_stopped and not _click_fired:
                         if _is_blocked():
                             log_debug(_MOD, "AutoClick suppressed — awaiting first move, drag, or cooldown.")
+                            # Reset still_since so we don't spam this log on every poll tick.
                             still_since = time.monotonic()
                         else:
                             self._perform_click()
                             _click_fired = True
-                            _last_successful_update = now
-
-                    # Failsafe: if position tracking hasn't updated for too long (stale state),
-                    # reset it. This prevents freezing if blocking conditions get stuck.
-                    if now - _last_successful_update > _STATE_RESET_TIMEOUT_S:
-                        log_debug(_MOD, "Position tracking stale for %.1fs — resetting state to recover from freeze.", 
-                                  now - _last_successful_update)
-                        last_x, last_y = cur_x, cur_y
-                        still_since = now
-                        _click_fired = False
-                        _last_successful_update = now
 
                 time.sleep(_POLL_INTERVAL_S)
 

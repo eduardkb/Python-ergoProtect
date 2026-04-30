@@ -51,5 +51,6 @@ After completing the changes, generate a new `.zip` file containing the updated 
     
 ==========================================
 Fix issues:
-- Autoclick freezing issue. Ressetting the autoclick thread does not restore it to work. On log, I see messages "2026-04-30 09:10:25.228,AutoClick,DEBUG,"AutoClick suppressed — awaiting first move, drag, or cooldown." When autoclick stops working. It is possible that after some Keyboard Actions module interactions, the auto click module does not identify mouse movement anymore.
+- While typing, mouse clicks automatically when mouse hasn't been moved. Messages displayed on log when this happens: "2026-04-30 10:33:15.871,AutoClick,DEBUG,Position tracking stale for 5.0s — resetting state to recover from freeze." Mouse AutoClick should only be fired after the mouse has moved and stopped for x ammount of pixels (x = environment variable defined).
+- Log "2026-04-30 10:41:26.922,AutoClick,DEBUG,Position tracking stale for 5.0s — resetting state to recover from freeze." is constantly being written on the log. even after the whole application is freshly restarted. And, AutoClick is being fired all the time even when the application is freshly restarted.
 ==========================================
