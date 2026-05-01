@@ -51,6 +51,5 @@ After completing the changes, generate a new `.zip` file containing the updated 
     
 ==========================================
 Fix issues:
-- While typing, mouse clicks automatically when mouse hasn't been moved. Messages displayed on log when this happens: "2026-04-30 10:33:15.871,AutoClick,DEBUG,Position tracking stale for 5.0s — resetting state to recover from freeze." Mouse AutoClick should only be fired after the mouse has moved and stopped for x ammount of pixels (x = environment variable defined).
-- Log "2026-04-30 10:41:26.922,AutoClick,DEBUG,Position tracking stale for 5.0s — resetting state to recover from freeze." is constantly being written on the log. even after the whole application is freshly restarted. And, AutoClick is being fired all the time even when the application is freshly restarted.
+- after manual or Keyboard Actions initiated drag-drop action, when the left mouse button is released after 1 second the auto click function clicks the left mouse button. This is a problem because when selecting text, it auto-clicks the left button 1 second after selecting the text making the text un-selected. When releasing the left mouse button auto-click should ignore the click right after the left mouse button was released if the mouse cursor hasn't moved for more than 10 pixels.
 ==========================================
