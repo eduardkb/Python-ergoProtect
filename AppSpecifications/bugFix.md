@@ -1,6 +1,6 @@
 ## Task Overview
 Analyze the existing project files (provided as a `.zip`). Apply the required modifications described in the **“Bug Fix Instructions”** section to the Python code.
-Be as efficient as possible writing code to use as few AI resources as possible.
+Be as efficient as possible. Write as few output lines as possible. Priority is generating the .zip output file.
 If you need more than 2 tries to identify the problem, stop the reasoning to solve the problem.
 After completing the changes, generate a new `.zip` file containing the updated code.
 
@@ -51,5 +51,15 @@ After completing the changes, generate a new `.zip` file containing the updated 
     
 ==========================================
 Fix issues:
-- after manual or Keyboard Actions initiated drag-drop action, when the left mouse button is released after 1 second the auto click function clicks the left mouse button. This is a problem because when selecting text, it auto-clicks the left button 1 second after selecting the text making the text un-selected. When releasing the left mouse button auto-click should ignore the click right after the left mouse button was released if the mouse cursor hasn't moved for more than 10 pixels.
+- fix 1 = every 30 seconds I get the logs below very consistently. Is the applciation expected to forcefully restart the hooks every 30 seconds? if not, fix the code. if yes, remove the  error and only leave a warning saying that these have been restarted.
+2026-05-08 13:33:40.775,KeyboardActions,ERROR,EXCLUSIVE KEY BINDING LOST — No keypress heartbeat for 24.0s (threshold=20.0s) — hook appears frozen. Performing automatic hook restart.
+2026-05-08 13:33:40.775,KeyboardActions,INFO,All hotkeys unregistered.
+2026-05-08 13:33:40.776,KeyboardActions,INFO,Hotkey registered: F7 → _do_left_click()
+2026-05-08 13:33:40.776,KeyboardActions,INFO,Hotkey registered: F8 → _do_right_click()
+2026-05-08 13:33:40.776,KeyboardActions,INFO,Hotkey registered: F9 → _do_double_click()
+2026-05-08 13:33:40.776,KeyboardActions,INFO,Hotkey registered: F10 → _do_drag_drop()
+2026-05-08 13:33:40.776,KeyboardActions,DEBUG,Heartbeat hook registered.
+2026-05-08 13:33:40.776,KeyboardActions,INFO,Keyboard hooks successfully restarted by watchdog.
+
+- Fix 2 = In General tab, when initializing the app and no log path exists as default, the default should be the same location where the .exe file is located or where the application is being executed from. This location should have a folder named "app_logs". if it doesn't, create it. and logs should be stored inside this folder. Save this default path to the config.ini file wherever it is not present and also save new log path configuration whenever changed
 ==========================================

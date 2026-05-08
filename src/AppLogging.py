@@ -108,15 +108,22 @@ def _default_log_dir() -> str:
     """
     Return the default directory for log files.
 
-    When running as a frozen executable (PyInstaller), this is the folder
-    containing the .exe. When running from source, it is the project root
-    (one level above the src/ package).
+    Always returns an 'app_logs' subfolder located next to the running
+    executable (PyInstaller) or next to the project root (source run).
+    The directory is created automatically if it does not exist.
     """
     if getattr(sys, "frozen", False):
-        return os.path.dirname(sys.executable)
-    # Running from source: go up from src/ to project root.
-    src_dir = os.path.dirname(os.path.abspath(__file__))
-    return os.path.dirname(src_dir)
+        base = os.path.dirname(sys.executable)
+    else:
+        # Running from source: go up from src/ to project root.
+        src_dir = os.path.dirname(os.path.abspath(__file__))
+        base = os.path.dirname(src_dir)
+    log_dir = os.path.join(base, "app_logs")
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+    except OSError:
+        pass
+    return log_dir
 
 
 def _today_log_path(log_dir: str) -> str:

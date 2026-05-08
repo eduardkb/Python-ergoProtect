@@ -59,7 +59,7 @@ import tkinter as tk
 from tkinter import ttk
 
 try:
-    from pynput.mouse import Button, Controller as MouseController
+    from pynput.mouse import Button, Controller as MouseController, Listener as MouseListener
     import keyboard as kb_lib
     _DEPS_AVAILABLE = True
 except ImportError:
@@ -77,11 +77,10 @@ _MOD = "KeyboardActions"
 # Watchdog configuration
 # ---------------------------------------------------------------------------
 # How often (seconds) the watchdog checks whether the keyboard hook is alive.
-_WATCHDOG_INTERVAL_S: float = 10.0
-# Maximum seconds of silence before the hook is considered frozen.
-# A heartbeat event is injected every _WATCHDOG_INTERVAL_S; if the hook is
-# alive it will be seen within this window.
-_HOOK_STALE_THRESHOLD_S: float = 25.0
+_WATCHDOG_INTERVAL_S: float = 8.0
+# Maximum seconds of silence before the hook is considered stale (when no
+# keypresses have been seen and the listener thread appears unhealthy).
+_HOOK_STALE_THRESHOLD_S: float = 20.0
 
 # ---------------------------------------------------------------------------
 # Module-level shared state (read by AutoClick.py for interference prevention)
@@ -146,6 +145,15 @@ class KeyboardActionsService:
         self._hotkey_handlers: list = []
         self._heartbeat_hook_ref = None
 
+        # pynput mouse listener that intercepts any mouse press during an active
+        # drag-drop to release the held button and restore hook state cleanly.
+        self._drag_mouse_listener: MouseListener | None = None
+
+        # keyboard on_press hook that stops an active drag when any non-drag key
+        # is pressed (e.g. F7/F8/F9 or any other key). Stored so it can be
+        # removed selectively without touching other modules' hooks.
+        self._drag_stop_key_hook_ref = None
+
         log_info(_MOD, "Service instance created.")
 
     # ------------------------------------------------------------------
@@ -193,6 +201,7 @@ class KeyboardActionsService:
         log_info(_MOD, "stop() requested.")
         self._stop_event.set()
         self._release_drag_if_active("application stop")
+        self._stop_drag_mouse_listener()
 
         if self._thread:
             self._thread.join(timeout=2.0)
@@ -268,25 +277,42 @@ class KeyboardActionsService:
                 hook_alive = self._is_keyboard_hook_alive()
                 heartbeat_age = time.monotonic() - self._last_heartbeat
 
-                # Trigger recovery when the internal listener is dead.
-                # Also trigger when no heartbeat has been received for longer
-                # than the stale threshold AND the listener looks unhealthy
-                # (avoids false positives during periods of no user activity).
-                hook_stale = (not hook_alive) or (
-                    heartbeat_age > _HOOK_STALE_THRESHOLD_S and not hook_alive
+                # Also check that our registered handler count matches what we expect
+                # (4 action hotkeys + 1 heartbeat). If handlers were silently lost,
+                # re-register even if the listener appears alive.
+                expected_action_handlers = 4
+                handlers_lost = (
+                    len(self._hotkey_handlers) < expected_action_handlers
+                    or self._heartbeat_hook_ref is None
                 )
 
-                if hook_stale:
+                # Trigger recovery when:
+                #   1. The internal OS listener thread is dead, OR
+                #   2. Handlers have been silently lost.
+                # NOTE: heartbeat_age alone is NOT a restart trigger — the user may
+                # simply be idle (not pressing keys) which is normal behaviour and
+                # must never cause a spurious hook restart.
+                restart_reason = None
+                if not hook_alive:
+                    restart_reason = (
+                        f"OS keyboard listener thread is dead "
+                        f"(heartbeat_age={heartbeat_age:.1f}s, "
+                        f"handlers_registered={len(self._hotkey_handlers)})"
+                    )
+                elif handlers_lost:
+                    restart_reason = (
+                        f"Hotkey handler count mismatch: expected {expected_action_handlers} "
+                        f"action handlers + heartbeat, found {len(self._hotkey_handlers)} "
+                        f"action handlers, heartbeat_ref={'set' if self._heartbeat_hook_ref else 'MISSING'}"
+                    )
+
+                if restart_reason:
                     log_warning(
                         _MOD,
-                        "Keyboard hook appears dead (listener_alive=%s, heartbeat_age=%.1fs) "
-                        "— performing automatic hook restart.",
-                        hook_alive, heartbeat_age,
+                        "Keyboard hooks restarted by watchdog — %s.",
+                        restart_reason,
                     )
                     self._restart_hooks()
-                # else:
-                    # log_debug(_MOD, "Watchdog: hook OK (listener_alive=%s, heartbeat_age=%.1fs).",
-                    #          hook_alive, heartbeat_age)
             except Exception:
                 log_error(_MOD, "Watchdog loop encountered an unexpected error.", exc_info=True)
 
@@ -324,12 +350,20 @@ class KeyboardActionsService:
     def _restart_hooks(self) -> None:
         """
         Safely unregister and re-register all hotkeys.
-        Called by the watchdog to recover from a dead hook (e.g. after hibernation).
+        Called by the watchdog to recover from a dead hook (e.g. after hibernation,
+        screen lock, UAC prompt, or post-drag binding corruption).
 
         Re-creates the MouseController to recover from any pynput state that
         became invalid while the OS was suspended during hibernation.
+        Also releases any active drag to prevent a stuck mouse button.
         """
         try:
+            # Release any active drag first — the hook restart will press/release
+            # nothing, so if a drag is active it must be cleaned up explicitly.
+            self._release_drag_if_active("watchdog hook restart")
+            # Stop drag-stop listeners before re-registering to avoid stale refs.
+            self._stop_drag_stop_listeners()
+
             with self._hooks_lock:
                 self._unregister_hotkeys()
                 self._last_heartbeat = time.monotonic()  # reset before re-hook
@@ -480,25 +514,25 @@ class KeyboardActionsService:
         """
         Toggle drag-and-drop state machine.
 
-        First F10 press:  Press and HOLD left mouse button → drag_active = True
-        Second F10 press: Release left mouse button        → drag_active = False
+        First F10 press:  Press and HOLD left mouse button → drag_active = True.
+                          Installs a pynput mouse listener and a keyboard on_press
+                          hook so that ANY mouse button press or ANY keyboard key
+                          press (including F7/F8/F9) immediately releases the drag
+                          and restores the hotkeys cleanly.
+        Second F10 press: Release left mouse button → drag_active = False.
+                          Removes the drag-stop listeners.
 
-        No timeout. No auto-release on key/mouse events. Clean toggle only.
+        This prevents the bug where pressing a key or mouse button while a drag
+        is active would leave the left button held and corrupt the hook state.
         """
         global drag_active, last_drag_end_time
 
         with self._drag_lock:
             if drag_active:
-                # Second press: release the drag
-                try:
-                    self._mouse.release(Button.left)
-                except Exception:
-                    log_error(_MOD, "Failed to release left button on drag toggle.", exc_info=True)
-                drag_active = False
-                last_drag_end_time = time.monotonic()
-                log_info(_MOD, "Drag-drop released (F10 toggle off).")
+                # Explicit F10 toggle-off: release the drag and clean up listeners.
+                self._end_drag_locked("F10 toggle off")
             else:
-                # First press: start the drag
+                # First press: start the drag.
                 try:
                     self._mouse.press(Button.left)
                     drag_active = True
@@ -506,6 +540,165 @@ class KeyboardActionsService:
                 except Exception:
                     drag_active = False
                     log_error(_MOD, "Failed to press left button for drag-drop.", exc_info=True)
+                    return
+
+                # Install listeners AFTER drag_active is True so their callbacks
+                # don't race with this assignment.
+                self._start_drag_stop_listeners()
+
+    def _end_drag_locked(self, reason: str) -> None:
+        """
+        Release the held left mouse button and update drag state.
+
+        MUST be called with self._drag_lock already held (or from a context
+        where no concurrent drag state mutation is possible).
+
+        After releasing the button the drag-stop listeners are removed (they
+        are no longer needed) and hotkeys are immediately re-verified so that
+        any binding corruption caused by key presses during the drag is repaired
+        before the user notices.
+        """
+        global drag_active, last_drag_end_time
+        drag_active = False
+        last_drag_end_time = time.monotonic()
+        try:
+            if self._mouse:
+                self._mouse.release(Button.left)
+        except Exception:
+            log_error(_MOD, "Failed to release left button during drag end.", exc_info=True)
+        log_info(_MOD, "Drag-drop ended. Reason: %s", reason)
+
+        # Remove drag-stop listeners in a separate thread to avoid deadlock:
+        # both listeners call back into this code path, so we can't stop them
+        # from within their own callbacks without risking a join deadlock.
+        t = threading.Thread(
+            target=self._stop_drag_stop_listeners_and_reverify,
+            name="DragStopCleanup",
+            daemon=True,
+        )
+        t.start()
+
+    def _start_drag_stop_listeners(self) -> None:
+        """
+        Install a pynput mouse listener and a keyboard on_press hook that each
+        call _on_drag_interrupted() when any mouse button or keyboard key is
+        pressed during an active drag. These ensure the drag is released cleanly
+        regardless of which input device the user uses to stop it.
+        """
+        if not _DEPS_AVAILABLE:
+            return
+
+        # Mouse listener: stops drag on any mouse button press.
+        try:
+            def _mouse_stop(x, y, button, pressed):
+                if pressed and drag_active:
+                    log_info(
+                        _MOD,
+                        "Drag-drop interrupted by mouse button press (%s) — releasing drag.",
+                        button,
+                    )
+                    self._on_drag_interrupted("mouse button press: " + str(button))
+                # Returning False stops the pynput listener.
+                return not drag_active
+
+            self._drag_mouse_listener = MouseListener(on_click=_mouse_stop)
+            self._drag_mouse_listener.daemon = True
+            self._drag_mouse_listener.start()
+            log_debug(_MOD, "Drag-stop mouse listener started.")
+        except Exception:
+            log_error(_MOD, "Could not start drag-stop mouse listener.", exc_info=True)
+
+        # Keyboard hook: stops drag on any key press (suppress=False so the
+        # key event still reaches other hooks — we only want to detect it, not
+        # consume it, and the other hotkeys will handle it normally).
+        try:
+            def _key_stop(event):
+                if drag_active:
+                    # Ignore F10 itself — that is handled by _do_drag_drop toggle.
+                    drag_key = self._key_for("leftDragDrop", "F10").lower()
+                    if event.name and event.name.lower() == drag_key:
+                        return
+                    log_info(
+                        _MOD,
+                        "Drag-drop interrupted by key press (%s) — releasing drag.",
+                        event.name,
+                    )
+                    self._on_drag_interrupted("key press: " + str(event.name))
+
+            self._drag_stop_key_hook_ref = kb_lib.on_press(_key_stop, suppress=False)
+            log_debug(_MOD, "Drag-stop keyboard hook registered.")
+        except Exception:
+            log_error(_MOD, "Could not register drag-stop keyboard hook.", exc_info=True)
+
+    def _on_drag_interrupted(self, reason: str) -> None:
+        """
+        Called by the drag-stop mouse listener or keyboard hook when a button/key
+        press is detected while a drag is active.  Releases the drag and schedules
+        hotkey re-verification.
+        """
+        with self._drag_lock:
+            if not drag_active:
+                return  # Already released (race between mouse and key callbacks).
+            self._end_drag_locked(reason)
+
+    def _stop_drag_stop_listeners(self) -> None:
+        """Stop and discard the drag-stop mouse listener (safe to call any time)."""
+        if self._drag_mouse_listener is not None:
+            try:
+                self._drag_mouse_listener.stop()
+            except Exception:
+                pass
+            self._drag_mouse_listener = None
+
+        if self._drag_stop_key_hook_ref is not None:
+            try:
+                kb_lib.unhook(self._drag_stop_key_hook_ref)
+            except Exception:
+                pass
+            self._drag_stop_key_hook_ref = None
+
+    def _stop_drag_stop_listeners_and_reverify(self) -> None:
+        """
+        Remove drag-stop listeners then immediately verify that all action hotkeys
+        are still correctly registered.  Runs in its own daemon thread to avoid
+        deadlock when called from inside a listener callback.
+
+        This is the second half of the fix for the hotkey-loss-after-drag bug:
+        pressing a key during a drag can disrupt the keyboard library's internal
+        hook state, so we proactively re-register after every drag end to ensure
+        exclusive bindings are intact.
+        """
+        # Small delay so pynput/keyboard can finish processing the event that
+        # triggered the drag stop before we begin re-registration.
+        time.sleep(0.05)
+        self._stop_drag_stop_listeners()
+
+        # Re-verify hotkeys: unregister and re-register to ensure the OS-level
+        # hook is still correctly bound after the key/button that stopped the drag.
+        try:
+            with self._hooks_lock:
+                if self._hotkeys_registered:
+                    registered_count = len(self._hotkey_handlers)
+                    expected = 4
+                    if registered_count < expected or self._heartbeat_hook_ref is None:
+                        log_error(
+                            _MOD,
+                            "EXCLUSIVE KEY BINDING LOST after drag-drop end — "
+                            "only %d of %d action handlers registered, heartbeat=%s. "
+                            "Re-registering all hotkeys now.",
+                            registered_count, expected,
+                            "set" if self._heartbeat_hook_ref else "MISSING",
+                        )
+                        self._unregister_hotkeys()
+                        self._register_hotkeys()
+                    else:
+                        log_debug(
+                            _MOD,
+                            "Post-drag hotkey verification OK (%d handlers registered).",
+                            registered_count,
+                        )
+        except Exception:
+            log_error(_MOD, "Post-drag hotkey re-verification failed.", exc_info=True)
 
     def _release_drag_if_active(self, reason: str) -> None:
         """
@@ -513,18 +706,10 @@ class KeyboardActionsService:
         Called from stop() and exception handlers to ensure the button is never
         left permanently pressed when the application exits or crashes.
         """
-        global drag_active, last_drag_end_time
         with self._drag_lock:
             if not drag_active:
                 return
-            drag_active = False
-            last_drag_end_time = time.monotonic()
-        try:
-            if self._mouse:
-                self._mouse.release(Button.left)
-            log_info(_MOD, "Drag-drop force-released. Reason: %s", reason)
-        except Exception:
-            log_error(_MOD, "Could not force-release drag button.", exc_info=True)
+            self._end_drag_locked(reason)
 
 
 # ---------------------------------------------------------------------------

@@ -1,3 +1,4 @@
+APP_VERSION = "1.0.2"
 """
 GraphicalInterface.py - Main Application Window for ErgoProtect
 ----------------------------------------------------------------
@@ -103,7 +104,7 @@ class GraphicalInterface:
 
     def _configure_window(self) -> None:
         """Set title, size, icon and other window-manager properties."""
-        self._root.title("ErgoProtect")
+        self._root.title(f"ErgoProtect {APP_VERSION}")
         self._root.geometry("640x480")
         self._root.minsize(480, 380)
         self._root.resizable(True, False)

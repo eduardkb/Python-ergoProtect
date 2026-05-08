@@ -132,7 +132,7 @@ def _release_single_instance_lock() -> None:
 
 from src.generate_icon import make_icon as _make_icon
 from src.config_manager import ConfigManager
-from src.AppLogging import init_logging, cleanup_old_logs, log_info, log_error, shutdown_logging
+from src.AppLogging import init_logging, cleanup_old_logs, log_info, log_error, shutdown_logging, get_log_dir
 from src.GraphicalInterface import GraphicalInterface
 
 from src import AutoClick
@@ -279,6 +279,15 @@ def main() -> None:
     days_to_keep = config_manager.get_int("General", "DaysToKeepLog", 30)
 
     init_logging(log_dir=log_dir, days_to_keep=days_to_keep)
+
+    # If no log path was in config, persist the resolved default (app_logs
+    # subfolder next to the exe/project root) so the General tab shows the
+    # correct path and future runs reuse the same folder.
+    if not log_dir:
+        resolved_log_dir = get_log_dir()
+        config_manager.set_config("General", "logfilePath", resolved_log_dir)
+        log_dir = resolved_log_dir
+        log_info("main", "Default log directory saved to config: %s", log_dir)
 
     # --- Log cleanup (delete old log files) -----------------------------
     # Run on every startup as required by specification.
