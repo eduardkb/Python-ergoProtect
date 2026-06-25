@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.0.6] - 2026-06-25
+
+### Fixed
+- **KeyboardActions – PowerEventWatcher persistent OverflowError on 64-bit Windows**: The previous fix (`c_void_p(-3)`) still overflowed because ctypes was guessing 32-bit int for every argument of `CreateWindowExW`. Fixed by explicitly declaring `argtypes`, using `ctypes.c_size_t` for the parent-HWND parameter so `HWND_MESSAGE = -3` is correctly pointer-sized on 64-bit Windows. Also hardened `PostMessageW` in `stop()` by wrapping the stored HWND in `ctypes.wintypes.HWND()`.
+
 ## [1.0.5] - 2026-06-25
 
 ### Fixed

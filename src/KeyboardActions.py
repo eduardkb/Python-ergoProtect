@@ -148,7 +148,9 @@ class _PowerEventWatcher:
         # Post a quit message to unblock the message loop if it is waiting.
         if self._hwnd:
             try:
-                ctypes.windll.user32.PostMessageW(self._hwnd, 0x0012, 0, 0)  # WM_QUIT
+                ctypes.windll.user32.PostMessageW(
+                    ctypes.wintypes.HWND(self._hwnd), 0x0012, 0, 0
+                )
             except Exception:
                 pass
         if self._thread:
@@ -199,14 +201,28 @@ class _PowerEventWatcher:
 
             ctypes.windll.user32.RegisterClassW(ctypes.byref(wc))
 
-            # HWND_MESSAGE = -3 creates a message-only window (no UI).
-            # Must be passed as a plain int, not wrapped in ctypes.wintypes.HWND,
-            # to avoid an OverflowError on 64-bit Windows.
-            HWND_MESSAGE = -3
-            hwnd = ctypes.windll.user32.CreateWindowExW(
+            user32 = ctypes.windll.user32
+            user32.CreateWindowExW.argtypes = [
+                ctypes.wintypes.DWORD,
+                ctypes.wintypes.LPCWSTR,
+                ctypes.wintypes.LPCWSTR,
+                ctypes.wintypes.DWORD,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_size_t,
+                ctypes.wintypes.HMENU,
+                ctypes.wintypes.HINSTANCE,
+                ctypes.wintypes.LPVOID,
+            ]
+            user32.CreateWindowExW.restype = ctypes.wintypes.HWND
+
+            HWND_MESSAGE = ctypes.c_size_t(-3).value
+            hwnd = user32.CreateWindowExW(
                 0, class_name, "PowerWatcher", 0,
                 0, 0, 0, 0,
-                ctypes.c_void_p(HWND_MESSAGE), None, wc.hInstance, None,
+                HWND_MESSAGE, None, wc.hInstance, None,
             )
             self._hwnd = hwnd
 
