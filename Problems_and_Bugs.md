@@ -1,6 +1,6 @@
 # Next ToDo's
 - Problems
-    
+    - on .exe file location, inside log folder, files older than 30 days are not being deleted
 
 - Bugs:
     
