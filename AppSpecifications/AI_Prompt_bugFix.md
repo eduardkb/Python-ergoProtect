@@ -9,7 +9,7 @@ Requirements:
 - recovery time of the function keys (default f6 through f10 ) when mapping is lost is too long. it is way longer than 10 seconds.
 - the mapping is usually lost after computer comes back from hybernation or sleep.
 - make a new safe and more reliable solution so that these function keys are recovered within 30 seconds. 
-- keep logging (as warning level) any time this key mappings is lost and recovered
+- make sure to do logging (as warning level) any time this key mappings is lost and recovered
 
 ======================
 On every modification also:

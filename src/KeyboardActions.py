@@ -53,6 +53,7 @@ joints, directly supporting users at risk of or recovering from tendinitis
 and Musculoskeletal Disorders.
 """
 
+import sys
 import threading
 import time
 import tkinter as tk
@@ -64,6 +65,16 @@ try:
     _DEPS_AVAILABLE = True
 except ImportError:
     _DEPS_AVAILABLE = False
+
+# Windows power-event support (optional — gracefully absent on non-Windows).
+_WIN32_AVAILABLE = False
+if sys.platform == "win32":
+    try:
+        import ctypes
+        import ctypes.wintypes
+        _WIN32_AVAILABLE = True
+    except Exception:
+        pass
 
 try:
     from src.AppLogging import log_info, log_warning, log_error, log_debug
@@ -77,10 +88,12 @@ _MOD = "KeyboardActions"
 # Watchdog configuration
 # ---------------------------------------------------------------------------
 # How often (seconds) the watchdog checks whether the keyboard hook is alive.
-_WATCHDOG_INTERVAL_S: float = 8.0
+# 5 s ensures recovery well within the 30 s requirement even without the
+# power-event hook (which triggers an immediate restart on wake from sleep).
+_WATCHDOG_INTERVAL_S: float = 5.0
 # Maximum seconds of silence before the hook is considered stale (when no
 # keypresses have been seen and the listener thread appears unhealthy).
-_HOOK_STALE_THRESHOLD_S: float = 20.0
+_HOOK_STALE_THRESHOLD_S: float = 15.0
 
 # ---------------------------------------------------------------------------
 # Module-level shared state (read by AutoClick.py for interference prevention)
@@ -89,6 +102,130 @@ _HOOK_STALE_THRESHOLD_S: float = 20.0
 drag_active: bool = False
 # Timestamp of the last drag-end (used by AutoClick for 5-second cooldown).
 last_drag_end_time: float = 0.0
+
+
+# ---------------------------------------------------------------------------
+# Windows power-event watcher
+# ---------------------------------------------------------------------------
+
+class _PowerEventWatcher:
+    """
+    Listen for Windows WM_POWERBROADCAST / PBT_APMRESUMEAUTOMATIC messages
+    and call a callback immediately when the machine wakes from hibernation
+    or sleep.  This allows the watchdog to trigger an instant hook restart
+    instead of waiting up to _WATCHDOG_INTERVAL_S seconds.
+
+    On non-Windows platforms or when ctypes is unavailable this class is a
+    no-op; start() and stop() both return immediately without error.
+    """
+
+    # Power-broadcast event codes (from WinUser.h)
+    _WM_POWERBROADCAST = 0x0218
+    _PBT_APMRESUMESUSPEND = 0x0007        # resume after user interaction
+    _PBT_APMRESUMEAUTOMATIC = 0x0012      # resume without user interaction (e.g. hibernate)
+
+    def __init__(self, on_resume) -> None:
+        self._on_resume = on_resume
+        self._thread: threading.Thread | None = None
+        self._hwnd = None
+        self._stop_event = threading.Event()
+
+    def start(self) -> None:
+        if not _WIN32_AVAILABLE:
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="KeyboardActionsPowerWatcher",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        if not _WIN32_AVAILABLE:
+            return
+        self._stop_event.set()
+        # Post a quit message to unblock the message loop if it is waiting.
+        if self._hwnd:
+            try:
+                ctypes.windll.user32.PostMessageW(self._hwnd, 0x0012, 0, 0)  # WM_QUIT
+            except Exception:
+                pass
+        if self._thread:
+            self._thread.join(timeout=3.0)
+
+    def _run(self) -> None:
+        """Create a hidden message-only window and pump messages."""
+        try:
+            WndProcType = ctypes.WINFUNCTYPE(
+                ctypes.c_long,
+                ctypes.wintypes.HWND,
+                ctypes.wintypes.UINT,
+                ctypes.wintypes.WPARAM,
+                ctypes.wintypes.LPARAM,
+            )
+
+            def _wnd_proc(hwnd, msg, wparam, lparam):
+                if msg == self._WM_POWERBROADCAST:
+                    if wparam in (self._PBT_APMRESUMESUSPEND, self._PBT_APMRESUMEAUTOMATIC):
+                        try:
+                            self._on_resume()
+                        except Exception:
+                            pass
+                return ctypes.windll.user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+            wnd_proc = WndProcType(_wnd_proc)
+
+            WNDCLASSW = type("WNDCLASSW", (ctypes.Structure,), {
+                "_fields_": [
+                    ("style", ctypes.wintypes.UINT),
+                    ("lpfnWndProc", WndProcType),
+                    ("cbClsExtra", ctypes.c_int),
+                    ("cbWndExtra", ctypes.c_int),
+                    ("hInstance", ctypes.wintypes.HINSTANCE),
+                    ("hIcon", ctypes.wintypes.HICON),
+                    ("hCursor", ctypes.wintypes.HANDLE),
+                    ("hbrBackground", ctypes.wintypes.HBRUSH),
+                    ("lpszMenuName", ctypes.wintypes.LPCWSTR),
+                    ("lpszClassName", ctypes.wintypes.LPCWSTR),
+                ]
+            })
+
+            class_name = "ErgoProtectPowerWatcher"
+            wc = WNDCLASSW()
+            wc.lpfnWndProc = wnd_proc
+            wc.lpszClassName = class_name
+            wc.hInstance = ctypes.windll.kernel32.GetModuleHandleW(None)
+
+            ctypes.windll.user32.RegisterClassW(ctypes.byref(wc))
+
+            # HWND_MESSAGE = -3 creates a message-only window (no UI).
+            HWND_MESSAGE = ctypes.wintypes.HWND(-3)
+            hwnd = ctypes.windll.user32.CreateWindowExW(
+                0, class_name, "PowerWatcher", 0,
+                0, 0, 0, 0,
+                HWND_MESSAGE, None, wc.hInstance, None,
+            )
+            self._hwnd = hwnd
+
+            msg = ctypes.wintypes.MSG()
+            while not self._stop_event.is_set():
+                result = ctypes.windll.user32.PeekMessageW(
+                    ctypes.byref(msg), None, 0, 0, 1  # PM_REMOVE = 1
+                )
+                if result:
+                    ctypes.windll.user32.TranslateMessage(ctypes.byref(msg))
+                    ctypes.windll.user32.DispatchMessageW(ctypes.byref(msg))
+                    if msg.message == 0x0012:  # WM_QUIT
+                        break
+                else:
+                    self._stop_event.wait(timeout=0.1)
+
+            if hwnd:
+                ctypes.windll.user32.DestroyWindow(hwnd)
+            ctypes.windll.user32.UnregisterClassW(class_name, wc.hInstance)
+        except Exception:
+            log_error(_MOD, "PowerEventWatcher thread failed.", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +291,14 @@ class KeyboardActionsService:
         # removed selectively without touching other modules' hooks.
         self._drag_stop_key_hook_ref = None
 
+        # Power-event watcher: triggers an immediate hook restart on wake from
+        # hibernation or sleep so recovery happens within seconds, not minutes.
+        self._power_watcher = _PowerEventWatcher(on_resume=self._on_system_resume)
+
+        # Track whether we have already emitted a "mapping lost" warning so we
+        # can pair it with exactly one "mapping recovered" warning per event.
+        self._mapping_lost: bool = False
+
         log_info(_MOD, "Service instance created.")
 
     # ------------------------------------------------------------------
@@ -191,7 +336,9 @@ class KeyboardActionsService:
         )
         self._watchdog_thread.start()
 
-        log_info(_MOD, "Service thread and watchdog started.")
+        self._power_watcher.start()
+
+        log_info(_MOD, "Service thread, watchdog, and power-event watcher started.")
 
     def stop(self) -> None:
         """
@@ -202,6 +349,7 @@ class KeyboardActionsService:
         self._stop_event.set()
         self._release_drag_if_active("application stop")
         self._stop_drag_mouse_listener()
+        self._power_watcher.stop()
 
         if self._thread:
             self._thread.join(timeout=2.0)
@@ -308,11 +456,19 @@ class KeyboardActionsService:
                     )
 
                 if restart_reason:
-                    log_warning(
-                        _MOD,
-                        "Keyboard hooks restarted by watchdog — %s.",
-                        restart_reason,
-                    )
+                    if not self._mapping_lost:
+                        log_warning(
+                            _MOD,
+                            "Key mappings lost — %s. Attempting recovery.",
+                            restart_reason,
+                        )
+                        self._mapping_lost = True
+                    else:
+                        log_warning(
+                            _MOD,
+                            "Keyboard hooks restarted by watchdog — %s.",
+                            restart_reason,
+                        )
                     self._restart_hooks()
             except Exception:
                 log_error(_MOD, "Watchdog loop encountered an unexpected error.", exc_info=True)
@@ -348,6 +504,27 @@ class KeyboardActionsService:
             # Any introspection error → assume alive to avoid restart storms.
             return True
 
+    def _on_system_resume(self) -> None:
+        """
+        Called immediately by the power-event watcher when Windows fires
+        PBT_APMRESUMESUSPEND or PBT_APMRESUMEAUTOMATIC (wake from sleep /
+        hibernation).  Schedules an immediate hook restart so key mappings are
+        restored within a few seconds rather than waiting for the next watchdog
+        poll cycle.
+        """
+        log_warning(
+            _MOD,
+            "System resume from sleep/hibernation detected — key mappings may be lost. "
+            "Scheduling immediate hook restart.",
+        )
+        self._mapping_lost = True
+        t = threading.Thread(
+            target=self._restart_hooks,
+            name="KeyboardActionsResumeRestart",
+            daemon=True,
+        )
+        t.start()
+
     def _restart_hooks(self) -> None:
         """
         Safely unregister and re-register all hotkeys.
@@ -377,6 +554,7 @@ class KeyboardActionsService:
                     log_error(_MOD, "Could not re-create MouseController in watchdog restart.", exc_info=True)
                 self._register_hotkeys()
             log_warning(_MOD, "Keyboard hooks successfully restarted by watchdog after failure (post-hibernation/sleep/UAC recovery complete).")
+            self._mapping_lost = False
         except Exception:
             log_error(_MOD, "Failed to restart keyboard hooks in watchdog.", exc_info=True)
 
