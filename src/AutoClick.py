@@ -111,6 +111,8 @@ class AutoClickService:
         # before autoclick is allowed after a drag/selection release.
         self._drag_release_x: float = 0.0
         self._drag_release_y: float = 0.0
+        # Throttle flag: ensures the drag-release stillness log is only written once per drag.
+        self._drag_release_logged: bool = False
 
         log_info(_MOD, "Service instance created.")
 
@@ -305,7 +307,7 @@ class AutoClickService:
 
                 self._register_hotkey()
                 self._start_mouse_listener()
-                log_info(_MOD, "Monitor thread successfully restarted by watchdog.")
+                log_warning(_MOD, "Monitor thread successfully restarted by watchdog after failure (post-hibernation/sleep recovery complete).")
 
             except Exception:
                 log_error(_MOD, "Watchdog encountered an unexpected error.", exc_info=True)
@@ -378,6 +380,7 @@ class AutoClickService:
                         # must be still for a full delay period after releasing a drag/selection
                         # before autoclick fires — prevents immediate deselection of selected text.
                         self._drag_just_released = True
+                        self._drag_release_logged = False
                         log_debug(_MOD,
                                   "Manual drag released (held %.2fs) at (%d, %d) — "
                                   "autoclick cooldown %.1fs.",
@@ -525,9 +528,12 @@ class AutoClickService:
                     else:
                         still_since = now
                         _click_fired = False
-                        log_debug(_MOD, 
-                                  "Drag/selection released — stillness timer reset (moved %.1fpx).",
-                                  drag_distance)
+                        if not self._drag_release_logged:
+                            log_debug(_MOD,
+                                      "Drag/selection released — stillness timer reset (moved %.1fpx). "
+                                      "Waiting for 10px movement to clear drag state.",
+                                      drag_distance)
+                            self._drag_release_logged = True
 
                 # Detect F10 keyboard drag end: when drag_active transitions True→False,
                 # reset the stillness timer for the same reason as a manual drag release.
@@ -589,7 +595,7 @@ class AutoClickService:
         self._active = self._cfg.get_bool("autoClick", "active", False)
         # Do NOT clear stop_event here — the watchdog will detect the dead
         # thread and perform a full restart including clearing stop_event.
-        log_info(_MOD, "AutoClick recovered from exception — watchdog will restart thread.")
+        log_warning(_MOD, "AutoClick recovered from unexpected exception — watchdog will restart thread.")
 
 
 # ---------------------------------------------------------------------------

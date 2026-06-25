@@ -215,7 +215,7 @@ def _on_exit(icon, item, gui: GraphicalInterface) -> None:
     gui.root.after(0, lambda: _shutdown(icon, gui))
 
 
-def _shutdown(icon: "pystray.Icon", gui: GraphicalInterface) -> None:
+def _shutdown(icon: "pystray.Icon", gui: GraphicalInterface) -> None: # type: ignore
     """
     Perform a clean application shutdown.
 

@@ -245,6 +245,7 @@ class KeyboardActionsService:
             self._release_drag_if_active("service loop exception")
             # Clear stop_event so a subsequent start() is not immediately cancelled.
             self._stop_event.clear()
+            log_warning(_MOD, "Service loop recovered from exception — service will need to be re-enabled or watchdog will restart hooks.")
         finally:
             with self._hooks_lock:
                 self._unregister_hotkeys()
@@ -375,7 +376,7 @@ class KeyboardActionsService:
                 except Exception:
                     log_error(_MOD, "Could not re-create MouseController in watchdog restart.", exc_info=True)
                 self._register_hotkeys()
-            log_info(_MOD, "Keyboard hooks successfully restarted by watchdog.")
+            log_warning(_MOD, "Keyboard hooks successfully restarted by watchdog after failure (post-hibernation/sleep/UAC recovery complete).")
         except Exception:
             log_error(_MOD, "Failed to restart keyboard hooks in watchdog.", exc_info=True)
 
@@ -691,6 +692,7 @@ class KeyboardActionsService:
                         )
                         self._unregister_hotkeys()
                         self._register_hotkeys()
+                        log_warning(_MOD, "Post-drag hotkey re-registration complete — exclusive key bindings restored.")
                     else:
                         log_debug(
                             _MOD,
