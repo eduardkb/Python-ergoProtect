@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.0.5] - 2026-06-25
+
+### Fixed
+- **KeyboardActions – PowerEventWatcher crash on 64-bit Windows**: `HWND_MESSAGE` was incorrectly wrapped in `ctypes.wintypes.HWND(-3)`, causing an `OverflowError` when passed as argument 11 to `CreateWindowExW` on 64-bit Windows. Fixed by passing it as `ctypes.c_void_p(-3)` instead, which correctly handles the pointer-sized value on both 32-bit and 64-bit targets.
+
 ## [1.0.4] - 2026-06-25
 
 ### Fixed

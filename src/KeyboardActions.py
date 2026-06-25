@@ -200,11 +200,13 @@ class _PowerEventWatcher:
             ctypes.windll.user32.RegisterClassW(ctypes.byref(wc))
 
             # HWND_MESSAGE = -3 creates a message-only window (no UI).
-            HWND_MESSAGE = ctypes.wintypes.HWND(-3)
+            # Must be passed as a plain int, not wrapped in ctypes.wintypes.HWND,
+            # to avoid an OverflowError on 64-bit Windows.
+            HWND_MESSAGE = -3
             hwnd = ctypes.windll.user32.CreateWindowExW(
                 0, class_name, "PowerWatcher", 0,
                 0, 0, 0, 0,
-                HWND_MESSAGE, None, wc.hInstance, None,
+                ctypes.c_void_p(HWND_MESSAGE), None, wc.hInstance, None,
             )
             self._hwnd = hwnd
 
