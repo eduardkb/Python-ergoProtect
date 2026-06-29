@@ -88,12 +88,11 @@ _MOD = "KeyboardActions"
 # Watchdog configuration
 # ---------------------------------------------------------------------------
 # How often (seconds) the watchdog checks whether the keyboard hook is alive.
-# 5 s ensures recovery well within the 30 s requirement even without the
-# power-event hook (which triggers an immediate restart on wake from sleep).
-_WATCHDOG_INTERVAL_S: float = 5.0
+# 2 s ensures recovery within a few seconds of any hook failure.
+_WATCHDOG_INTERVAL_S: float = 2.0
 # Maximum seconds of silence before the hook is considered stale (when no
 # keypresses have been seen and the listener thread appears unhealthy).
-_HOOK_STALE_THRESHOLD_S: float = 15.0
+_HOOK_STALE_THRESHOLD_S: float = 8.0
 
 # ---------------------------------------------------------------------------
 # Module-level shared state (read by AutoClick.py for interference prevention)
@@ -386,7 +385,32 @@ class KeyboardActionsService:
             self._unregister_hotkeys()
             self._register_hotkeys()
 
-    # ------------------------------------------------------------------
+    def force_reregister_all(self) -> None:
+        """
+        Unconditionally unregister and re-register all keyboard hooks.
+        Called externally (e.g. by AutoClick when its Active toggle changes)
+        to ensure all function keys (F6 through F10) are re-bound after any
+        state change that might have disturbed the keyboard library's hook state.
+        """
+        log_info(_MOD, "force_reregister_all() called — re-registering all function key hooks.")
+        try:
+            self._release_drag_if_active("force re-register")
+            self._stop_drag_stop_listeners()
+            with self._hooks_lock:
+                self._unregister_hotkeys()
+                self._last_heartbeat = time.monotonic()
+                try:
+                    if _DEPS_AVAILABLE:
+                        self._mouse = MouseController()
+                except Exception:
+                    log_error(_MOD, "Could not re-create MouseController in force_reregister_all.", exc_info=True)
+                self._register_hotkeys()
+            self._mapping_lost = False
+            log_info(_MOD, "force_reregister_all() complete — all function key hooks restored.")
+        except Exception:
+            log_error(_MOD, "force_reregister_all() failed.", exc_info=True)
+
+
     # Internal: service loop
     # ------------------------------------------------------------------
 
@@ -455,10 +479,10 @@ class KeyboardActionsService:
 
                 # Trigger recovery when:
                 #   1. The internal OS listener thread is dead, OR
-                #   2. Handlers have been silently lost.
-                # NOTE: heartbeat_age alone is NOT a restart trigger — the user may
-                # simply be idle (not pressing keys) which is normal behaviour and
-                # must never cause a spurious hook restart.
+                #   2. Handlers have been silently lost, OR
+                #   3. Heartbeat has been stale for longer than threshold AND hook
+                #      reports alive (zombie/frozen hook — keys received by OS but
+                #      not dispatched to our callbacks).
                 restart_reason = None
                 if not hook_alive:
                     restart_reason = (
@@ -471,6 +495,13 @@ class KeyboardActionsService:
                         f"Hotkey handler count mismatch: expected {expected_action_handlers} "
                         f"action handlers + heartbeat, found {len(self._hotkey_handlers)} "
                         f"action handlers, heartbeat_ref={'set' if self._heartbeat_hook_ref else 'MISSING'}"
+                    )
+                elif heartbeat_age > _HOOK_STALE_THRESHOLD_S:
+                    # Hook reports alive but no keypresses detected for a long time.
+                    # This indicates a zombie/frozen hook state — re-register proactively.
+                    restart_reason = (
+                        f"Heartbeat stale for {heartbeat_age:.1f}s (threshold={_HOOK_STALE_THRESHOLD_S}s) "
+                        f"— hook may be frozen even though listener appears alive"
                     )
 
                 if restart_reason:
@@ -993,6 +1024,25 @@ def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
                         log_warning(_MOD, "Service thread was dead — performing clean restart. Find out why and correct.")
                         _service.stop()
                     _service.start()
+                    # Force re-register ALL function keys (F7–F10) immediately.
+                    _service.force_reregister_all()
+                    # Also re-register F6 (AutoClick hotkey) via AutoClick service.
+                    try:
+                        import AutoClick as _ac_mod
+                    except ImportError:
+                        try:
+                            from src import AutoClick as _ac_mod
+                        except ImportError:
+                            _ac_mod = None
+                    if _ac_mod is not None:
+                        _ac_svc = _ac_mod.get_service()
+                        if _ac_svc is not None:
+                            try:
+                                _ac_svc._unregister_hotkey()
+                                _ac_svc._register_hotkey()
+                                log_info(_MOD, "AutoClick F6 hotkey re-registered from KeyboardActions Active toggle.")
+                            except Exception:
+                                log_error(_MOD, "Failed to re-register AutoClick hotkey from KeyboardActions toggle.", exc_info=True)
                     status_label.config(
                         text="Service running. Hotkeys are active system-wide.",
                         foreground="#228822",

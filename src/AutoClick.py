@@ -645,6 +645,34 @@ def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
         config_manager.set_config("autoClick", "active", str(new_val))
         if _service:
             _service.set_active(new_val)
+        # When toggled ON, force re-register ALL function keys (F6 via AutoClick,
+        # F7–F10 via KeyboardActions) to recover any lost hooks immediately.
+        if new_val:
+            log_info(_MOD, "AutoClick Active toggled ON — forcing re-registration of all function key hooks.")
+            # Re-register F6 (this service's hotkey).
+            if _service:
+                try:
+                    _service._unregister_hotkey()
+                    _service._register_hotkey()
+                    log_info(_MOD, "AutoClick F6 hotkey re-registered from Active toggle.")
+                except Exception:
+                    log_error(_MOD, "Failed to re-register AutoClick hotkey on Active toggle.", exc_info=True)
+            # Re-register F7–F10 via KeyboardActions service.
+            try:
+                import KeyboardActions as _ka_mod
+            except ImportError:
+                try:
+                    from src import KeyboardActions as _ka_mod
+                except ImportError:
+                    _ka_mod = None
+            if _ka_mod is not None:
+                _ka_svc = _ka_mod.get_service()
+                if _ka_svc is not None:
+                    try:
+                        _ka_svc.force_reregister_all()
+                        log_info(_MOD, "KeyboardActions F7–F10 hotkeys re-registered from AutoClick Active toggle.")
+                    except Exception:
+                        log_error(_MOD, "Failed to re-register KeyboardActions hotkeys from AutoClick toggle.", exc_info=True)
 
     ttk.Label(frame, text="Enable AutoClick:").grid(row=1, column=0, sticky="w", pady=6)
     ttk.Checkbutton(

@@ -6,10 +6,8 @@ Always zip only the files that needed to be modified (keeping the folder structu
 
 ====================
 Requirements:
-- recovery time of the function keys (default f6 through f10 ) when mapping is lost is too long. it is way longer than 10 seconds.
-- the mapping is usually lost after computer comes back from hybernation or sleep.
-- make a new safe and more reliable solution so that these function keys are recovered within 30 seconds. 
-- make sure to do logging (as warning level) any time this key mappings is lost and recovered
+- I think the application is still loosing the function keys (F6 through F10) from time to time and taking way over 5 minutes to recover them. Make a better logic to recover them as fast as possible.
+- on Keyboard Actions tab, there is a checkbox called "Active". Make a logic so that besides activating and deactivating the F7 thourgh F10 keys it also forces re-registering all function keys including the F6 key. Do the same for the toggle on the auto click tab. So, if either of these two toggles are changed to "checked" state, they will re-register all function keys (default f6 through F10)
 
 ======================
 On every modification also:

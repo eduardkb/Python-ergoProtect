@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.0.7] - 2026-06-29
+
+### Fixed
+- **KeyboardActions – Faster hook recovery**: Reduced watchdog check interval from 5 s to 2 s and stale threshold from 15 s to 8 s, so lost function key hooks are detected and recovered much faster (within a few seconds instead of potentially minutes).
+- **KeyboardActions – Zombie hook detection**: Watchdog now also triggers re-registration when the heartbeat has been stale beyond the threshold even if the OS listener appears alive, catching "frozen" hook states that previously went undetected.
+- **KeyboardActions – New `force_reregister_all()` method**: Added a public method to unconditionally unregister and re-register all F7–F10 hooks, used by the Active toggle and by AutoClick to ensure clean hook state.
+- **KeyboardActions Active checkbox – Re-registers all function keys**: Toggling the "Active" checkbox to checked now forces immediate re-registration of F7–F10 (KeyboardActions) and also re-registers F6 (AutoClick hotkey), restoring all function keys at once.
+- **AutoClick Active checkbox – Re-registers all function keys**: Toggling the AutoClick "Active" checkbox to checked now forces immediate re-registration of F6 (AutoClick) and F7–F10 (KeyboardActions), restoring all function keys at once.
+
 ## [1.0.6] - 2026-06-25
 
 ### Fixed
