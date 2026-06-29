@@ -466,9 +466,8 @@ class KeyboardActionsService:
                     continue
 
                 hook_alive = self._is_keyboard_hook_alive()
-                heartbeat_age = time.monotonic() - self._last_heartbeat
 
-                # Also check that our registered handler count matches what we expect
+                # Check that our registered handler count matches what we expect
                 # (4 action hotkeys + 1 heartbeat). If handlers were silently lost,
                 # re-register even if the listener appears alive.
                 expected_action_handlers = 4
@@ -477,14 +476,19 @@ class KeyboardActionsService:
                     or self._heartbeat_hook_ref is None
                 )
 
-                # Trigger recovery when:
-                #   1. The internal OS listener thread is dead, OR
-                #   2. Handlers have been silently lost, OR
-                #   3. Heartbeat has been stale for longer than threshold AND hook
-                #      reports alive (zombie/frozen hook — keys received by OS but
-                #      not dispatched to our callbacks).
+                # Trigger recovery ONLY when:
+                #   1. The internal OS listener thread is confirmed dead, OR
+                #   2. Handlers have been silently removed from memory.
+                #
+                # NOTE: A stale heartbeat alone is NOT sufficient to trigger a
+                # restart. Heartbeat only updates on actual keypresses, so during
+                # normal idle (user not pressing any keys) it will always appear
+                # stale — that is expected behaviour, not a fault. We only use
+                # heartbeat age as a secondary signal when the hook is already
+                # dead (case 1) to enrich the log message.
                 restart_reason = None
                 if not hook_alive:
+                    heartbeat_age = time.monotonic() - self._last_heartbeat
                     restart_reason = (
                         f"OS keyboard listener thread is dead "
                         f"(heartbeat_age={heartbeat_age:.1f}s, "
@@ -496,28 +500,18 @@ class KeyboardActionsService:
                         f"action handlers + heartbeat, found {len(self._hotkey_handlers)} "
                         f"action handlers, heartbeat_ref={'set' if self._heartbeat_hook_ref else 'MISSING'}"
                     )
-                elif heartbeat_age > _HOOK_STALE_THRESHOLD_S:
-                    # Hook reports alive but no keypresses detected for a long time.
-                    # This indicates a zombie/frozen hook state — re-register proactively.
-                    restart_reason = (
-                        f"Heartbeat stale for {heartbeat_age:.1f}s (threshold={_HOOK_STALE_THRESHOLD_S}s) "
-                        f"— hook may be frozen even though listener appears alive"
-                    )
 
                 if restart_reason:
                     if not self._mapping_lost:
+                        # First detection — log a warning and attempt recovery.
                         log_warning(
                             _MOD,
                             "Key mappings lost — %s. Attempting recovery.",
                             restart_reason,
                         )
                         self._mapping_lost = True
-                    else:
-                        log_warning(
-                            _MOD,
-                            "Keyboard hooks restarted by watchdog — %s.",
-                            restart_reason,
-                        )
+                    # Silently retry until recovery succeeds; avoid log spam on
+                    # repeated watchdog cycles while the hook is still down.
                     self._restart_hooks()
             except Exception:
                 log_error(_MOD, "Watchdog loop encountered an unexpected error.", exc_info=True)
@@ -602,7 +596,8 @@ class KeyboardActionsService:
                 except Exception:
                     log_error(_MOD, "Could not re-create MouseController in watchdog restart.", exc_info=True)
                 self._register_hotkeys()
-            log_warning(_MOD, "Keyboard hooks successfully restarted by watchdog after failure (post-hibernation/sleep/UAC recovery complete).")
+            if self._mapping_lost:
+                log_warning(_MOD, "Hotkeys have been recovered — keyboard hooks successfully restarted by watchdog.")
             self._mapping_lost = False
         except Exception:
             log_error(_MOD, "Failed to restart keyboard hooks in watchdog.", exc_info=True)
@@ -649,7 +644,7 @@ class KeyboardActionsService:
                 # (F8=next error), etc. from also acting on the same keystroke.
                 handler = kb_lib.add_hotkey(key, callback, suppress=True)
                 self._hotkey_handlers.append(handler)
-                log_info(_MOD, "Hotkey registered: %s → %s()", key, callback.__name__)
+                log_debug(_MOD, "Hotkey registered: %s → %s()", key, callback.__name__)
             except Exception:
                 log_error(_MOD, "Could not register hotkey '%s' for %s.", key, param, exc_info=True)
 
@@ -696,7 +691,7 @@ class KeyboardActionsService:
             self._heartbeat_hook_ref = None
 
         self._hotkeys_registered = False
-        log_info(_MOD, "All hotkeys unregistered.")
+        log_debug(_MOD, "All hotkeys unregistered.")
 
     def _heartbeat_hook(self, _event) -> None:
         """

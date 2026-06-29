@@ -6,8 +6,7 @@ Always zip only the files that needed to be modified (keeping the folder structu
 
 ====================
 Requirements:
-- I think the application is still loosing the function keys (F6 through F10) from time to time and taking way over 5 minutes to recover them. Make a better logic to recover them as fast as possible.
-- on Keyboard Actions tab, there is a checkbox called "Active". Make a logic so that besides activating and deactivating the F7 thourgh F10 keys it also forces re-registering all function keys including the F6 key. Do the same for the toggle on the auto click tab. So, if either of these two toggles are changed to "checked" state, they will re-register all function keys (default f6 through F10)
+- Log "2026-06-29 12:24:31.012,AutoClick,DEBUG,Left button physically pressed — autoclick blocked." being printed constantgly. do not consider autoclick interaction as "left button physically pressed". plus, ignore drag lock if the drag took less than 300 millisseconds.
 
 ======================
 On every modification also:

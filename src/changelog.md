@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.0.10] - 2026-06-29
+
+### Fixed
+- **AutoClick – Eliminated spurious "Left button physically pressed" log spam**: Fixed a thread race condition where the autoclick guard flag (`_is_auto_clicking`) was not safely visible to the mouse listener thread, causing synthetic clicks to be misidentified as physical presses. A dedicated lock now protects the flag, ensuring the log only fires for genuine user input.
+- **AutoClick – Drag lock threshold reduced to 300 ms**: Drag/selection cooldown is now only applied when the left button is held for at least 300 ms (previously 500 ms). Shorter clicks are ignored, preventing unnecessary autoclick delays after quick taps.
+
+## [1.0.8] - 2026-06-29
+
+### Fixed
+- **KeyboardActions – Eliminated spurious watchdog warnings**: The watchdog no longer treats an idle heartbeat (no keypresses from the user) as a sign of a broken hook. A stale heartbeat alone is not meaningful — hooks only fire on actual key presses. Recovery is now triggered only when the OS hook thread is genuinely dead or hotkey handlers are found to be missing.
+- **KeyboardActions – Reduced log noise during recovery**: Per-key registration and unregistration log lines are now DEBUG-level so they don't appear in normal INFO logs. The "hotkeys recovered" warning is emitted exactly once per loss/recovery cycle.
+- **KeyboardActions – Accurate recovery warning**: The warning "Hotkeys have been recovered" is now only written when hotkeys were actually lost and successfully restored, never during normal operation.
+
 ## [1.0.7] - 2026-06-29
 
 ### Fixed
