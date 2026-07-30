@@ -7,9 +7,12 @@
 Converting ErgoProtect to a single `.exe` means you (and others) can run it
 without installing Python at all.
 
-### Prerequisites
+### VENV and Prerequisites
 
 ```bash
+python -m venv venv
+.\venv\Scripts\activate
+
 pip install -r requirements.txt
 pip install pyinstaller
 ```

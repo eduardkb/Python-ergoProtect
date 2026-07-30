@@ -1178,6 +1178,67 @@ def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
         row=last_row, column=0, columnspan=3, sticky="ew", pady=(20, 8)
     )
 
+    def _on_reset_key_bindings() -> None:
+        """
+        Release all function-key bindings (F6 AutoClick + F7–F10 Keyboard
+        Actions) on the OS level, then re-bind them exclusively to this app.
+
+        F7–F10 are only reset when "Enable Keyboard Actions" is currently ON.
+        Resetting them while the feature is disabled would silently re-activate
+        the hotkeys system-wide without updating the checkbox/config, and
+        without the service thread/watchdog running to supervise them —
+        leaving the UI showing "disabled" while the hotkeys are actually live.
+        F6 (AutoClick) has no such disable switch — it is always the toggle
+        key — so it is always safe to reset.
+        """
+        log_info(_MOD, "Reset Key Bindings clicked — releasing and re-binding function key hooks.")
+        keyboard_actions_enabled = enabled_var.get()
+
+        # Release + re-bind F7–F10 (this service's hotkeys) — only if enabled.
+        if keyboard_actions_enabled:
+            if _service:
+                try:
+                    _service.force_reregister_all()
+                    log_info(_MOD, "Keyboard Actions F7–F10 hotkeys reset.")
+                except Exception:
+                    log_error(_MOD, "Failed to reset Keyboard Actions hotkeys.", exc_info=True)
+        else:
+            log_info(_MOD, "Keyboard Actions is disabled — skipping F7–F10 reset.")
+
+        # Release + re-bind F6 (AutoClick hotkey) via AutoClick service — always.
+        try:
+            import AutoClick as _ac_mod
+        except ImportError:
+            try:
+                from src import AutoClick as _ac_mod
+            except ImportError:
+                _ac_mod = None
+        if _ac_mod is not None:
+            _ac_svc = _ac_mod.get_service()
+            if _ac_svc is not None:
+                try:
+                    _ac_svc._unregister_hotkey()
+                    _ac_svc._register_hotkey()
+                    log_info(_MOD, "AutoClick F6 hotkey reset.")
+                except Exception:
+                    log_error(_MOD, "Failed to reset AutoClick hotkey.", exc_info=True)
+
+        if _DEPS_AVAILABLE:
+            if keyboard_actions_enabled:
+                status_label.config(
+                    text="Key bindings reset. Hotkeys re-bound to ErgoProtect.",
+                    foreground="#228822",
+                )
+            else:
+                status_label.config(
+                    text="F6 hotkey reset. Enable Keyboard Actions to also reset F7–F10.",
+                    foreground="#cc8800",
+                )
+
+    ttk.Button(
+        frame, text="Reset Key Bindings", command=_on_reset_key_bindings
+    ).grid(row=last_row + 1, column=0, columnspan=3, sticky="w", pady=(0, 8))
+
     if not _DEPS_AVAILABLE:
         status_text = "⚠  pynput / keyboard not installed — Keyboard Actions disabled."
         status_color = "#cc4444"
@@ -1194,7 +1255,7 @@ def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
         foreground=status_color,
         font=("Segoe UI", 9),
     )
-    status_label.grid(row=last_row + 1, column=0, columnspan=3, sticky="w")
+    status_label.grid(row=last_row + 2, column=0, columnspan=3, sticky="w")
 
     # Column weights so the description column stretches on resize.
     frame.columnconfigure(2, weight=1)

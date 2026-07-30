@@ -6,7 +6,8 @@ Always zip only the files that needed to be modified (keeping the folder structu
 
 ====================
 Requirements:
-- Log "2026-06-29 12:24:31.012,AutoClick,DEBUG,Left button physically pressed — autoclick blocked." being printed constantgly. do not consider autoclick interaction as "left button physically pressed". plus, ignore drag lock if the drag took less than 300 millisseconds.
+- on "Keyboard Actions" on the bottom of the screen before the status message insert a new button with text "Reset Key Bindings".
+- Implement this button's code so that whenever it is clicked all keys (default f6 for auto click and f7 through f10 for keyboard actions) are reset. meaning: release their exclusive bind on the OS level and then bind them again exclusively to this ErgoProtect App.
 
 ======================
 On every modification also:

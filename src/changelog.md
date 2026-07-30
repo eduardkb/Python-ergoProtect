@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.0.12] - 2026-07-30
+
+### Fixed
+- **Keyboard Actions – "Reset Key Bindings" no longer bypasses the disable toggle**: The button now only resets F7–F10 when "Enable Keyboard Actions" is on; while disabled it resets just F6, avoiding a state where hotkeys were silently reactivated with no service supervising them.
+- **AutoClick – Hotkey registration race fixed**: Registering/unregistering the F6 hotkey is now protected by a lock, preventing a rare race if two things (e.g. the watchdog and a manual reset) tried to change it at the same moment.
+
+## [1.0.11] - 2026-07-30
+
+### Added
+- **Keyboard Actions – "Reset Key Bindings" button**: Added a new button on the Keyboard Actions tab that lets you instantly release and re-bind all of ErgoProtect's function-key shortcuts (F6 for AutoClick, F7–F10 for Keyboard Actions) with a single click, useful if a key stops responding.
+
 ## [1.0.10] - 2026-06-29
 
 ### Fixed

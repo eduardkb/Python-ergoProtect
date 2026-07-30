@@ -85,6 +85,9 @@ class AutoClickService:
         # unhook_all_hotkeys(), which would wipe KeyboardActions hooks too.
         self._hotkey_handler = None
         self._hotkey_key: str = ""
+        # Serialises _register_hotkey()/_unregister_hotkey() so concurrent
+        # callers (GUI thread, watchdog thread) can't race on self._hotkey_handler.
+        self._hotkey_lock = threading.Lock()
 
         # Timestamp of last activation for post-activation cooldown.
         self._activation_time: float = 0.0
@@ -228,16 +231,19 @@ class AutoClickService:
         """
         if not _DEPS_AVAILABLE or self._hotkey_handler is not None:
             return
-        key = self._cfg.get_config("autoClick", "activate_key", "F6")
-        try:
-            # suppress=True: the keystroke is consumed exclusively by ErgoProtect
-            # and is NOT passed to any other window, application, or Windows itself.
-            self._hotkey_handler = kb_lib.add_hotkey(key, self.toggle, suppress=True)
-            self._hotkey_key = key
-            log_info(_MOD, "Exclusive hotkey registered (suppress=True) for key: %s", key)
-        except Exception:
-            self._hotkey_handler = None
-            log_error(_MOD, "Could not register hotkey '%s'.", key, exc_info=True)
+        with self._hotkey_lock:
+            if self._hotkey_handler is not None:
+                return  # already registered by another thread while we waited.
+            key = self._cfg.get_config("autoClick", "activate_key", "F6")
+            try:
+                # suppress=True: the keystroke is consumed exclusively by ErgoProtect
+                # and is NOT passed to any other window, application, or Windows itself.
+                self._hotkey_handler = kb_lib.add_hotkey(key, self.toggle, suppress=True)
+                self._hotkey_key = key
+                log_info(_MOD, "Exclusive hotkey registered (suppress=True) for key: %s", key)
+            except Exception:
+                self._hotkey_handler = None
+                log_error(_MOD, "Could not register hotkey '%s'.", key, exc_info=True)
 
     def _unregister_hotkey(self) -> None:
         """
@@ -249,15 +255,18 @@ class AutoClickService:
         """
         if self._hotkey_handler is None:
             return
-        try:
-            kb_lib.remove_hotkey(self._hotkey_handler)
-            log_info(_MOD, "Hotkey '%s' unregistered.", self._hotkey_key)
-        except Exception:
-            # Handler may already be gone (e.g. after hibernation hook reset).
-            log_debug(_MOD, "remove_hotkey() failed (may already be removed): %s", self._hotkey_key)
-        finally:
-            self._hotkey_handler = None
-            self._hotkey_key = ""
+        with self._hotkey_lock:
+            if self._hotkey_handler is None:
+                return  # already unregistered by another thread while we waited.
+            try:
+                kb_lib.remove_hotkey(self._hotkey_handler)
+                log_info(_MOD, "Hotkey '%s' unregistered.", self._hotkey_key)
+            except Exception:
+                # Handler may already be gone (e.g. after hibernation hook reset).
+                log_debug(_MOD, "remove_hotkey() failed (may already be removed): %s", self._hotkey_key)
+            finally:
+                self._hotkey_handler = None
+                self._hotkey_key = ""
 
     # ------------------------------------------------------------------
     # Watchdog loop — detects dead monitor thread (e.g. after hibernation)
