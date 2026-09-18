@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.0.19] - 2026-09-18
+
+### Fixed
+- **Keyboard Actions – Windows warning cleanup**: Fixed a 64-bit Windows message-handling error and removed a harmless heartbeat cleanup warning, while keeping function-key recovery available.
+
+## [1.0.18] - 2026-09-18
+
+### Fixed
+- **Keyboard Actions – False hook-loss errors**: The app no longer treats an internal simulated key test as a failed key binding, preventing repeated recovery errors when the function keys are working normally.
+
 ## [1.0.17] - 2026-09-18
 
 ### Fixed

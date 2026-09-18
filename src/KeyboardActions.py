@@ -269,13 +269,29 @@ class _PowerEventWatcher:
     def _run(self) -> None:
         """Create a hidden message-only window and pump messages."""
         try:
+            # ctypes.wintypes LPARAM/LRESULT can be 32-bit ``c_long`` even in
+            # a 64-bit process.  A window procedure must use pointer-sized
+            # values or Windows messages with pointer data overflow here.
+            hwnd_type = ctypes.c_void_p
+            wparam_type = ctypes.c_size_t
+            lparam_type = ctypes.c_ssize_t
+            lresult_type = ctypes.c_ssize_t
             WndProcType = ctypes.WINFUNCTYPE(
-                ctypes.c_long,
-                ctypes.wintypes.HWND,
+                lresult_type,
+                hwnd_type,
                 ctypes.wintypes.UINT,
-                ctypes.wintypes.WPARAM,
-                ctypes.wintypes.LPARAM,
+                wparam_type,
+                lparam_type,
             )
+
+            user32 = ctypes.windll.user32
+            user32.DefWindowProcW.argtypes = [
+                hwnd_type,
+                ctypes.wintypes.UINT,
+                wparam_type,
+                lparam_type,
+            ]
+            user32.DefWindowProcW.restype = lresult_type
 
             def _wnd_proc(hwnd, msg, wparam, lparam):
                 if msg == self._WM_POWERBROADCAST:
@@ -284,7 +300,7 @@ class _PowerEventWatcher:
                             self._on_resume()
                         except Exception:
                             pass
-                return ctypes.windll.user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+                return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
             wnd_proc = WndProcType(_wnd_proc)
 
@@ -311,7 +327,6 @@ class _PowerEventWatcher:
 
             ctypes.windll.user32.RegisterClassW(ctypes.byref(wc))
 
-            user32 = ctypes.windll.user32
             user32.CreateWindowExW.argtypes = [
                 ctypes.wintypes.DWORD,
                 ctypes.wintypes.LPCWSTR,
@@ -641,18 +656,15 @@ class KeyboardActionsService:
                     continue
 
                 current_time = time.monotonic()
-                # Perform probe every 5 seconds (not on every check cycle)
-                should_probe = (current_time - self._last_probe_time) >= self._probe_cooldown
+                # Synthetic input is deliberately ignored by many Windows low-level
+                # hooks (including keyboard's backend), even while physical F6-F10
+                # bindings work correctly.  It is not a reliable liveness signal.
+                should_probe = False
                 
                 hook_alive = self._is_keyboard_hook_alive()
                 probe_success = True
                 probe_error = None
                 
-                # Run end-to-end probe
-                if should_probe:
-                    self._last_probe_time = current_time
-                    probe_success, probe_error = self._run_e2e_probe()
-
                 # Check that our registered handler count matches what we expect
                 # (4 action hotkeys + 1 heartbeat). If handlers were silently lost,
                 # re-register even if the listener appears alive.
@@ -662,20 +674,11 @@ class KeyboardActionsService:
                     or self._heartbeat_hook_ref is None
                 )
 
-                # Trigger recovery when:
-                #   1. End-to-end probe fails (callback didn't fire)
-                #   2. The internal OS listener thread is confirmed dead, OR
-                #   3. Handlers have been silently removed from memory
+                # Trigger recovery only for observable hook failure: a dead
+                # listener thread or missing registered handlers.  Do not treat
+                # an injected test key as a failed physical-key binding.
                 restart_reason = None
-                if should_probe and not probe_success:
-                    restart_reason = (
-                        f"END-TO-END PROBE FAILED — Simulated keypress callback did not fire. "
-                        f"Details: {probe_error}. "
-                        f"Hook listener alive: {hook_alive}, "
-                        f"Handlers: {len(self._hotkey_handlers)}/{expected_action_handlers}, "
-                        f"Heartbeat: {'OK' if self._heartbeat_hook_ref else 'MISSING'}"
-                    )
-                elif not hook_alive:
+                if not hook_alive:
                     heartbeat_age = time.monotonic() - self._last_heartbeat
                     restart_reason = (
                         f"OS KEYBOARD LISTENER DEAD — Internal listener thread is no longer running. "
@@ -724,7 +727,7 @@ class KeyboardActionsService:
                             time.monotonic() - self._last_heartbeat,
                             probe_info
                         )
-                    watchdog_monitor.check_performed(hook_alive, "e2e_probe" if should_probe else "routine")
+                    watchdog_monitor.check_performed(hook_alive, "routine")
                 
                 self._check_count += 1
             except Exception:
@@ -1010,7 +1013,7 @@ class KeyboardActionsService:
             except Exception as e:
                 log_warning(_MOD, "  ⚠️  Heartbeat hook already removed or failed: %s", str(e))
         else:
-            log_warning(_MOD, "  ⚠️  Heartbeat hook ref is None")
+            log_debug(_MOD, "  Heartbeat hook ref is already clear.")
         
         log_info(
             _MOD,
