@@ -81,6 +81,15 @@ try:
 except ImportError:
     from AppLogging import log_info, log_warning, log_error, log_debug
 
+try:
+    from src.HookDiagnostics import (
+        hook_loss_detector, watchdog_monitor, hotkey_logger, log_diagnostic_summary
+    )
+except ImportError:
+    from HookDiagnostics import (
+        hook_loss_detector, watchdog_monitor, hotkey_logger, log_diagnostic_summary
+    )
+
 # Module identifier used in all log calls.
 _MOD = "KeyboardActions"
 
@@ -298,6 +307,7 @@ class KeyboardActionsService:
         # AutoClick module's F6 hotkey as an unintended side effect.
         self._hotkey_handlers: list = []
         self._heartbeat_hook_ref = None
+        self._check_count = 0  # Watchdog cycle counter for logging
 
         # pynput mouse listener that intercepts any mouse press during an active
         # drag-drop to release the held button and restore hook state cleanly.
@@ -331,42 +341,62 @@ class KeyboardActionsService:
         first to prevent ghost hooks, and clears the stop event.
         """
         if self._thread and self._thread.is_alive():
-            log_warning(_MOD, "start() called but service is already running — ignored.")
+            log_debug(_MOD, "start() called but service is already running — ignored.")
             return
 
+        log_info(_MOD, "=== KeyboardActions.start() BEGIN ===")
+        
         # Always unhook before re-registering to prevent ghost hooks on restart.
+        log_debug(_MOD, "  Cleaning up any previous hooks...")
         self._unregister_hotkeys()
         self._stop_event.clear()
         self._last_heartbeat = time.monotonic()
+        log_debug(_MOD, "  ✓ Cleanup complete, heartbeat reset")
 
+        log_debug(_MOD, "  Starting service loop thread...")
         self._thread = threading.Thread(
             target=self._service_loop,
             name="KeyboardActionsMonitor",
             daemon=True,
         )
         self._thread.start()
+        log_debug(_MOD, "  ✓ Service thread started")
 
+        log_debug(_MOD, "  Starting watchdog thread...")
         self._watchdog_thread = threading.Thread(
             target=self._watchdog_loop,
             name="KeyboardActionsWatchdog",
             daemon=True,
         )
         self._watchdog_thread.start()
+        log_debug(_MOD, "  ✓ Watchdog thread started")
 
+        log_debug(_MOD, "  Starting power-event watcher...")
         self._power_watcher.start()
+        log_debug(_MOD, "  ✓ Power-event watcher started")
 
-        log_info(_MOD, "Service thread, watchdog, and power-event watcher started.")
+        log_info(_MOD, "=== KeyboardActions.start() COMPLETE ===")
+        log_info(_MOD, "✓ Service thread, watchdog, and power-event watcher started successfully.")
 
     def stop(self) -> None:
         """
         Signal the service to stop, release any active drag, unregister hotkeys.
         Waits briefly for both threads to exit cleanly.
         """
-        log_info(_MOD, "stop() requested.")
+        log_info(_MOD, ">>> KeyboardActions.stop() requested - shutting down...")
         self._stop_event.set()
+        log_debug(_MOD, "  Stop event set")
+        
         self._release_drag_if_active("application stop")
+        log_debug(_MOD, "  ✓ Drag released if active")
+        
         self._stop_drag_mouse_listener()
+        log_debug(_MOD, "  ✓ Drag mouse listener stopped")
+        
         self._power_watcher.stop()
+        log_debug(_MOD, "  ✓ Power watcher stopped")
+        
+        log_info(_MOD, ">>> KeyboardActions.stop() complete")
 
         if self._thread:
             self._thread.join(timeout=2.0)
@@ -380,10 +410,14 @@ class KeyboardActionsService:
         Unregister all current hotkeys and re-register them from config.
         Called by the GUI when the user changes a key assignment.
         """
-        log_info(_MOD, "Reloading hotkeys from config.")
-        with self._hooks_lock:
-            self._unregister_hotkeys()
-            self._register_hotkeys()
+        log_info(_MOD, "=== reload_hotkeys() REQUESTED (user changed key assignment) ===")
+        try:
+            with self._hooks_lock:
+                self._unregister_hotkeys()
+                self._register_hotkeys()
+            log_info(_MOD, "✓ Hotkeys reloaded successfully from config")
+        except Exception as e:
+            log_error(_MOD, "❌ reload_hotkeys() FAILED: %s", str(e), exc_info=True)
 
     def force_reregister_all(self) -> None:
         """
@@ -391,24 +425,60 @@ class KeyboardActionsService:
         Called externally (e.g. by AutoClick when its Active toggle changes)
         to ensure all function keys (F6 through F10) are re-bound after any
         state change that might have disturbed the keyboard library's hook state.
+        
+        This is the "Reset Key Bindings" button action.
         """
-        log_info(_MOD, "force_reregister_all() called — re-registering all function key hooks.")
+        log_info(_MOD, "=== force_reregister_all() / RESET BUTTON PRESSED ===")
         try:
+            log_debug(_MOD, "  Step 1: Releasing any active drag...")
             self._release_drag_if_active("force re-register")
+            log_debug(_MOD, "  ✓ Drag released if active")
+            
+            log_debug(_MOD, "  Step 2: Stopping drag-stop listeners...")
             self._stop_drag_stop_listeners()
+            log_debug(_MOD, "  ✓ Drag-stop listeners stopped")
+            
             with self._hooks_lock:
+                log_debug(_MOD, "  Step 3: Unregistering all hotkeys...")
                 self._unregister_hotkeys()
+                
+                log_debug(_MOD, "  Step 4: Resetting heartbeat...")
                 self._last_heartbeat = time.monotonic()
+                
+                # Explicitly clear the keyboard library's entire hook state to ensure
+                # exclusive bindings are properly restored (suppress=True flag applied).
+                # This is critical when the library is in a corrupted state after
+                # system events (hibernation, screen lock, UAC prompts, etc).
+                log_debug(_MOD, "  Step 5: Clearing ALL keyboard hooks via unhook_all()...")
+                try:
+                    if _DEPS_AVAILABLE:
+                        kb_lib.unhook_all()
+                        log_info(_MOD, "  ✓ All keyboard hooks cleared via unhook_all()")
+                except Exception as e:
+                    log_error(_MOD, "  ❌ Could not unhook_all(): %s", str(e), exc_info=True)
+                    raise
+                
+                log_debug(_MOD, "  Step 6: Recreating MouseController...")
                 try:
                     if _DEPS_AVAILABLE:
                         self._mouse = MouseController()
-                except Exception:
-                    log_error(_MOD, "Could not re-create MouseController in force_reregister_all.", exc_info=True)
+                        log_info(_MOD, "  ✓ MouseController recreated")
+                except Exception as e:
+                    log_error(_MOD, "  ❌ Could not re-create MouseController: %s", str(e), exc_info=True)
+                    raise
+                
+                log_debug(_MOD, "  Step 7: Re-registering hotkeys...")
                 self._register_hotkeys()
+                log_info(_MOD, "  ✓ Hotkeys re-registered")
+            
             self._mapping_lost = False
-            log_info(_MOD, "force_reregister_all() complete — all function key hooks restored.")
-        except Exception:
-            log_error(_MOD, "force_reregister_all() failed.", exc_info=True)
+            log_info(_MOD, "=== RESET BUTTON / force_reregister_all() COMPLETE - SUCCESS ===")
+            log_info(_MOD, "✓ All function key hooks have been successfully restored.")
+            watchdog_monitor.recovery_succeeded()
+            hook_loss_detector.hook_recovered(context="force_reregister_all / RESET BUTTON")
+        except Exception as e:
+            log_error(_MOD, "❌ RESET BUTTON / force_reregister_all() FAILED: %s", str(e), exc_info=True)
+            watchdog_monitor.recovery_failed(error=str(e))
 
 
     # Internal: service loop
@@ -504,15 +574,36 @@ class KeyboardActionsService:
                 if restart_reason:
                     if not self._mapping_lost:
                         # First detection — log a warning and attempt recovery.
-                        log_warning(
+                        log_error(
                             _MOD,
-                            "Key mappings lost — %s. Attempting recovery.",
+                            "❌ ERROR: KEY MAPPINGS LOST — %s. Attempting recovery.",
                             restart_reason,
                         )
+                        hook_loss_detector.hook_lost(context=restart_reason)
+                        watchdog_monitor.recovery_attempted(context=restart_reason)
                         self._mapping_lost = True
                     # Silently retry until recovery succeeds; avoid log spam on
                     # repeated watchdog cycles while the hook is still down.
-                    self._restart_hooks()
+                    try:
+                        self._restart_hooks()
+                        watchdog_monitor.recovery_succeeded()
+                        hook_loss_detector.hook_recovered(context="watchdog auto-recovery")
+                    except Exception as e:
+                        watchdog_monitor.recovery_failed(error=str(e))
+                else:
+                    # Log periodic status (every 10th check to reduce noise)
+                    if self._check_count % 10 == 0:
+                        log_debug(
+                            _MOD,
+                            "Watchdog check #%d: Hook alive=%s, handlers=%d, heartbeat_age=%.1fs",
+                            self._check_count,
+                            hook_alive,
+                            len(self._hotkey_handlers),
+                            time.monotonic() - self._last_heartbeat
+                        )
+                    watchdog_monitor.check_performed(hook_alive, "routine check")
+                
+                self._check_count += 1
             except Exception:
                 log_error(_MOD, "Watchdog loop encountered an unexpected error.", exc_info=True)
 
@@ -579,28 +670,49 @@ class KeyboardActionsService:
         Also releases any active drag to prevent a stuck mouse button.
         """
         try:
+            log_info(_MOD, ">>> HOOK RESTART SEQUENCE START")
+            
             # Release any active drag first — the hook restart will press/release
             # nothing, so if a drag is active it must be cleaned up explicitly.
+            log_debug(_MOD, "  Step 1: Releasing any active drag...")
             self._release_drag_if_active("watchdog hook restart")
+            log_debug(_MOD, "  ✓ Drag released (if was active)")
+            
             # Stop drag-stop listeners before re-registering to avoid stale refs.
+            log_debug(_MOD, "  Step 2: Stopping drag-stop listeners...")
             self._stop_drag_stop_listeners()
+            log_debug(_MOD, "  ✓ Drag-stop listeners stopped")
 
             with self._hooks_lock:
+                log_debug(_MOD, "  Step 3: Unregistering existing hotkeys...")
                 self._unregister_hotkeys()
+                
+                log_debug(_MOD, "  Step 4: Resetting heartbeat timestamp...")
                 self._last_heartbeat = time.monotonic()  # reset before re-hook
+                
                 # Re-create mouse controller: pynput state can become invalid
                 # after the OS resumes from hibernation or a fast-user-switch.
+                log_debug(_MOD, "  Step 5: Recreating MouseController...")
                 try:
                     if _DEPS_AVAILABLE:
+                        old_mouse = self._mouse
                         self._mouse = MouseController()
-                except Exception:
-                    log_error(_MOD, "Could not re-create MouseController in watchdog restart.", exc_info=True)
+                        log_info(_MOD, "  ✓ MouseController recreated")
+                except Exception as e:
+                    log_error(_MOD, "  ❌ Could not re-create MouseController: %s", str(e), exc_info=True)
+                    raise
+                
+                log_debug(_MOD, "  Step 6: Re-registering hotkeys...")
                 self._register_hotkeys()
+                log_info(_MOD, "  ✓ Hotkeys re-registered")
+            
+            log_info(_MOD, ">>> HOOK RESTART SEQUENCE COMPLETE - SUCCESS")
             if self._mapping_lost:
-                log_warning(_MOD, "Hotkeys have been recovered — keyboard hooks successfully restarted by watchdog.")
+                log_info(_MOD, "✓ Hotkeys have been RECOVERED — keyboard hooks successfully restarted by watchdog.")
             self._mapping_lost = False
-        except Exception:
-            log_error(_MOD, "Failed to restart keyboard hooks in watchdog.", exc_info=True)
+        except Exception as e:
+            log_error(_MOD, "❌ FAILED to restart keyboard hooks in watchdog: %s", str(e), exc_info=True)
+            raise
 
     # ------------------------------------------------------------------
     # Hotkey registration
@@ -626,8 +738,11 @@ class KeyboardActionsService:
             log_warning(_MOD, "pynput/keyboard not installed — hotkeys disabled.")
             return
         if self._hotkeys_registered:
+            log_debug(_MOD, "_register_hotkeys called but already registered (skipping)")
             return
 
+        log_info(_MOD, ">>> REGISTERING ALL HOTKEYS START")
+        
         keys = {
             "leftClickKey":   (self._do_left_click,   "F7"),
             "rightClickKey":  (self._do_right_click,  "F8"),
@@ -635,6 +750,7 @@ class KeyboardActionsService:
             "leftDragDrop":   (self._do_drag_drop,    "F10"),
         }
 
+        registered_count = 0
         for param, (callback, default) in keys.items():
             key = self._key_for(param, default)
             try:
@@ -642,22 +758,34 @@ class KeyboardActionsService:
                 # and is NOT passed through to the currently focused application.
                 # This prevents apps like MS Excel (F7=spell check), VS Code
                 # (F8=next error), etc. from also acting on the same keystroke.
+                log_debug(_MOD, "  Registering hotkey: %s (param=%s)", key, param)
                 handler = kb_lib.add_hotkey(key, callback, suppress=True)
                 self._hotkey_handlers.append(handler)
-                log_debug(_MOD, "Hotkey registered: %s → %s()", key, callback.__name__)
-            except Exception:
-                log_error(_MOD, "Could not register hotkey '%s' for %s.", key, param, exc_info=True)
+                hotkey_logger.hotkey_registered(key, callback.__name__)
+                log_info(_MOD, "  ✓ Hotkey registered: %s → %s()", key, callback.__name__)
+                registered_count += 1
+            except Exception as e:
+                log_error(_MOD, "  ❌ FAILED to register hotkey '%s' for %s: %s", key, param, str(e), exc_info=True)
 
         # Heartbeat hook: updates _last_heartbeat on every keypress so the
         # watchdog can confirm the keyboard library's internal hook is alive.
         # suppress=False so the event still reaches other hooks and apps.
         try:
+            log_debug(_MOD, "  Registering heartbeat hook...")
             self._heartbeat_hook_ref = kb_lib.on_press(self._heartbeat_hook, suppress=False)
-            log_debug(_MOD, "Heartbeat hook registered.")
-        except Exception:
-            log_error(_MOD, "Could not register heartbeat hook.", exc_info=True)
+            log_info(_MOD, "  ✓ Heartbeat hook registered")
+        except Exception as e:
+            log_error(_MOD, "  ❌ FAILED to register heartbeat hook: %s", str(e), exc_info=True)
 
         self._hotkeys_registered = True
+        log_info(
+            _MOD,
+            ">>> REGISTERING ALL HOTKEYS COMPLETE - Registered %d/%d action hotkeys, heartbeat %s",
+            registered_count,
+            len(keys),
+            "OK" if self._heartbeat_hook_ref else "FAILED"
+        )
+        hook_loss_detector.hook_registered(context="_register_hotkeys()")
 
     def _unregister_hotkeys(self) -> None:
         """
@@ -674,20 +802,38 @@ class KeyboardActionsService:
         if not _DEPS_AVAILABLE:
             return
 
+        log_info(_MOD, ">>> UNREGISTERING ALL HOTKEYS START")
+        
         # Remove each action hotkey individually.
-        for handler in self._hotkey_handlers:
+        removed_count = 0
+        for i, handler in enumerate(self._hotkey_handlers):
             try:
+                log_debug(_MOD, "  Removing action hotkey #%d...", i + 1)
                 kb_lib.remove_hotkey(handler)
-            except Exception:
-                pass  # Already removed (e.g. after hibernation hook reset).
+                log_debug(_MOD, "  ✓ Action hotkey #%d removed", i + 1)
+                removed_count += 1
+            except Exception as e:
+                log_warning(_MOD, "  ⚠️  Action hotkey #%d already removed or failed: %s", i + 1, str(e))
+        
         self._hotkey_handlers.clear()
+        hotkey_logger.all_unregistered(removed_count)
 
         # Remove the heartbeat on_press hook.
         if self._heartbeat_hook_ref is not None:
             try:
+                log_debug(_MOD, "  Removing heartbeat hook...")
                 kb_lib.unhook(self._heartbeat_hook_ref)
-            except Exception:
-                pass
+                log_info(_MOD, "  ✓ Heartbeat hook removed")
+            except Exception as e:
+                log_warning(_MOD, "  ⚠️  Heartbeat hook already removed or failed: %s", str(e))
+        else:
+            log_warning(_MOD, "  ⚠️  Heartbeat hook ref is None")
+        
+        log_info(
+            _MOD,
+            ">>> UNREGISTERING ALL HOTKEYS COMPLETE - Removed %d action hotkeys",
+            removed_count
+        )
             self._heartbeat_hook_ref = None
 
         self._hotkeys_registered = False

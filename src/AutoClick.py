@@ -47,6 +47,11 @@ try:
 except ImportError:
     from AppLogging import log_info, log_warning, log_error, log_debug
 
+try:
+    from src.HookDiagnostics import hotkey_logger
+except ImportError:
+    from HookDiagnostics import hotkey_logger
+
 _MOD = "AutoClick"
 
 _POLL_INTERVAL_S = 0.02
@@ -229,21 +234,31 @@ class AutoClickService:
         The handler reference is stored so it can be removed selectively via
         keyboard.remove_hotkey(), avoiding any impact on KeyboardActions hooks.
         """
-        if not _DEPS_AVAILABLE or self._hotkey_handler is not None:
+        if not _DEPS_AVAILABLE:
+            log_warning(_MOD, "Dependencies not available - cannot register F6 hotkey")
             return
+        
+        if self._hotkey_handler is not None:
+            log_debug(_MOD, "_register_hotkey() called but already registered (skipping)")
+            return
+        
         with self._hotkey_lock:
             if self._hotkey_handler is not None:
+                log_debug(_MOD, "_register_hotkey() guard check - already registered by another thread")
                 return  # already registered by another thread while we waited.
+            
             key = self._cfg.get_config("autoClick", "activate_key", "F6")
             try:
+                log_info(_MOD, "=== Registering F6 AutoClick hotkey: %s ===", key)
                 # suppress=True: the keystroke is consumed exclusively by ErgoProtect
                 # and is NOT passed to any other window, application, or Windows itself.
                 self._hotkey_handler = kb_lib.add_hotkey(key, self.toggle, suppress=True)
                 self._hotkey_key = key
-                log_info(_MOD, "Exclusive hotkey registered (suppress=True) for key: %s", key)
-            except Exception:
+                hotkey_logger.hotkey_registered(key, "AutoClick.toggle")
+                log_info(_MOD, "✓ F6 AutoClick hotkey REGISTERED SUCCESSFULLY (suppress=True) for key: %s", key)
+            except Exception as e:
                 self._hotkey_handler = None
-                log_error(_MOD, "Could not register hotkey '%s'.", key, exc_info=True)
+                log_error(_MOD, "❌ ERROR: Could not register F6 hotkey '%s': %s", key, str(e), exc_info=True)
 
     def _unregister_hotkey(self) -> None:
         """
@@ -254,16 +269,29 @@ class AutoClickService:
         registered by the KeyboardActions module as a side effect.
         """
         if self._hotkey_handler is None:
+            log_debug(_MOD, "_unregister_hotkey() called but handler is None (skipping)")
             return
+        
         with self._hotkey_lock:
             if self._hotkey_handler is None:
+                log_debug(_MOD, "_unregister_hotkey() guard check - already unregistered by another thread")
                 return  # already unregistered by another thread while we waited.
+            
             try:
+                key_name = self._hotkey_key or "F6"
+                log_info(_MOD, ">>> Unregistering F6 AutoClick hotkey: %s", key_name)
                 kb_lib.remove_hotkey(self._hotkey_handler)
-                log_info(_MOD, "Hotkey '%s' unregistered.", self._hotkey_key)
-            except Exception:
+                hotkey_logger.hotkey_unregistered(key_name)
+                log_info(_MOD, "✓ F6 AutoClick hotkey '%s' unregistered successfully", key_name)
+            except Exception as e:
                 # Handler may already be gone (e.g. after hibernation hook reset).
-                log_debug(_MOD, "remove_hotkey() failed (may already be removed): %s", self._hotkey_key)
+                key_name = self._hotkey_key or "F6"
+                log_warning(
+                    _MOD,
+                    "⚠️  remove_hotkey() failed for '%s' (may already be removed): %s",
+                    key_name,
+                    str(e)
+                )
             finally:
                 self._hotkey_handler = None
                 self._hotkey_key = ""

@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.0.14] - 2026-07-31
+
+### Adding logging
+- **"Key Bindings" Added logging
+
+## [1.0.13] - 2026-07-31
+
+### Fixed
+- **Keyboard Actions – "Reset Key Bindings" now properly restores exclusive bindings**: The reset button now explicitly clears the keyboard library's entire hook state via `unhook_all()` before re-registering hotkeys, ensuring the `suppress=True` flag (exclusive binding) is properly applied when the library is in a corrupted state after system events like hibernation, screen lock, or UAC prompts.
+
 ## [1.0.12] - 2026-07-30
 
 ### Fixed

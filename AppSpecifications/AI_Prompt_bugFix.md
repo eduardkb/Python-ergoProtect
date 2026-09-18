@@ -6,8 +6,8 @@ Always zip only the files that needed to be modified (keeping the folder structu
 
 ====================
 Requirements:
-- on "Keyboard Actions" on the bottom of the screen before the status message insert a new button with text "Reset Key Bindings".
-- Implement this button's code so that whenever it is clicked all keys (default f6 for auto click and f7 through f10 for keyboard actions) are reset. meaning: release their exclusive bind on the OS level and then bind them again exclusively to this ErgoProtect App.
+- The newly added "Reset Key Bindings" button does not work. When the exclusive key bindings are lost (and they are lost frequently) this button does not restore the binding exclusively to this application. Fix this.
+
 
 ======================
 On every modification also:
