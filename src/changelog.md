@@ -1,5 +1,25 @@
 # Changelog
 
+## [1.0.23] - 2026-09-18
+
+### Improved
+- **Function Keys – Safer recovery checks**: Recovery now reports failure instead of silently completing if every required keyboard binding was not restored.
+
+## [1.0.22] - 2026-09-18
+
+### Fixed
+- **Function Keys – Permanent assignments**: F6 through F10 are now kept active with their required assignments for the full time ErgoProtect is running.
+
+## [1.0.21] - 2026-09-18
+
+### Improved
+- **Function Keys – More resilient recovery**: F6–F10 now rebuild together through one protected recovery process, stale queued actions are ignored, and all keyboard services close cleanly with the app.
+
+## [1.0.20] - 2026-09-18
+
+### Improved
+- **Keyboard Actions – Faster hook handling**: Function-key actions are now processed away from the Windows hook callback, helping keep the bindings responsive during logging and mouse actions.
+
 ## [1.0.19] - 2026-09-18
 
 ### Fixed

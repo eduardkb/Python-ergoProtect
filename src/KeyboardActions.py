@@ -57,6 +57,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import queue
 from tkinter import ttk
 
 try:
@@ -100,6 +101,9 @@ _MOD = "KeyboardActions"
 _native_hook_lock = threading.RLock()
 _native_hook_handles: list = []
 _native_hook_capture_installed = False
+# F6 and F7-F10 share keyboard's private listener singleton.  A single lock
+# makes every reset transactional across both services.
+_function_key_reset_lock = threading.RLock()
 
 
 def _install_native_hook_capture() -> None:
@@ -417,6 +421,18 @@ class KeyboardActionsService:
         # Heartbeat: updated by the _heartbeat_hook on every keypress.
         self._last_heartbeat: float = time.monotonic()
         self._hooks_lock = threading.Lock()  # serialises register/unregister
+        # Suppressed hotkeys execute in keyboard's low-level Windows callback.
+        # Queue all action work so that callback only performs put_nowait().
+        self._hook_action_queue: queue.SimpleQueue = queue.SimpleQueue()
+        self._binding_generation = 0
+        self._actions_enabled = False
+        self._last_f10_dispatch = 0.0
+        self._hook_action_thread = threading.Thread(
+            target=self._hook_action_loop,
+            name="KeyboardActionsHookWorker",
+            daemon=True,
+        )
+        self._hook_action_thread.start()
 
         # Individual handler references returned by add_hotkey() / on_press().
         # Stored so we can remove each one selectively with remove_hotkey() /
@@ -450,6 +466,28 @@ class KeyboardActionsService:
         self._probe_cooldown: float = 5.0  # seconds between probes
 
         log_info(_MOD, "Service instance created.")
+
+    def _enqueue_hook_action(self, action, generation: int, key: str) -> None:
+        """Minimal low-level-hook callback: queue work without logging or I/O."""
+        self._hook_action_queue.put_nowait((action, generation, key))
+
+    def _hook_action_loop(self) -> None:
+        """Run mouse actions and their logging away from the Windows hook."""
+        while True:
+            action, generation, key = self._hook_action_queue.get()
+            try:
+                # Never run input captured before a disable/reset.  F10 is
+                # debounced so keyboard autorepeat cannot create a stale drag.
+                if not self._actions_enabled or generation != self._binding_generation:
+                    continue
+                if key == "F10":
+                    now = time.monotonic()
+                    if now - self._last_f10_dispatch < 0.25:
+                        continue
+                    self._last_f10_dispatch = now
+                action()
+            except Exception:
+                log_error(_MOD, "Queued keyboard action failed.", exc_info=True)
 
     # ------------------------------------------------------------------
     # Public interface
@@ -542,16 +580,16 @@ class KeyboardActionsService:
         except Exception as e:
             log_error(_MOD, "❌ reload_hotkeys() FAILED: %s", str(e), exc_info=True)
 
-    def force_reregister_all(self) -> None:
+    def _rebuild_keyboard_actions_native(self) -> None:
         """
         Unconditionally unregister and re-register all keyboard hooks.
         Called externally (e.g. by AutoClick when its Active toggle changes)
         to ensure all function keys (F6 through F10) are re-bound after any
         state change that might have disturbed the keyboard library's hook state.
         
-        This is the "Reset Key Bindings" button action.
+        This is the Keyboard Actions portion of the shared F6-F10 reset.
         """
-        log_info(_MOD, "=== force_reregister_all() / RESET BUTTON PRESSED ===")
+        log_info(_MOD, "=== Native Keyboard Actions rebuild requested ===")
         try:
             log_debug(_MOD, "  Step 1: Releasing any active drag...")
             self._release_drag_if_active("force re-register")
@@ -592,16 +630,24 @@ class KeyboardActionsService:
                 
                 log_debug(_MOD, "  Step 7: Re-registering hotkeys...")
                 self._register_hotkeys()
+                if len(self._hotkey_handlers) != 4 or self._heartbeat_hook_ref is None:
+                    raise RuntimeError(
+                        "Fresh native hook did not register every F7-F10 handler and heartbeat."
+                    )
                 log_info(_MOD, "  ✓ Hotkeys re-registered")
             
             self._mapping_lost = False
-            log_info(_MOD, "=== RESET BUTTON / force_reregister_all() COMPLETE - SUCCESS ===")
-            log_info(_MOD, "✓ All function key hooks have been successfully restored.")
+            log_info(_MOD, "=== Native Keyboard Actions rebuild complete ===")
             watchdog_monitor.recovery_succeeded()
-            hook_loss_detector.hook_recovered(context="force_reregister_all / RESET BUTTON")
+            hook_loss_detector.hook_recovered(context="native keyboard-actions rebuild")
         except Exception as e:
-            log_error(_MOD, "❌ RESET BUTTON / force_reregister_all() FAILED: %s", str(e), exc_info=True)
+            log_error(_MOD, "❌ Native Keyboard Actions rebuild failed: %s", str(e), exc_info=True)
             watchdog_monitor.recovery_failed(error=str(e))
+            raise
+
+    def force_reregister_all(self) -> None:
+        """Rebuild the complete shared F6-F10 hook set transactionally."""
+        reset_function_key_bindings(include_keyboard_actions=True, reason="service request")
 
 
     # Internal: service loop
@@ -856,48 +902,14 @@ class KeyboardActionsService:
         Also releases any active drag to prevent a stuck mouse button.
         """
         try:
-            log_info(_MOD, ">>> HOOK RESTART SEQUENCE START")
-            
-            # Release any active drag first — the hook restart will press/release
-            # nothing, so if a drag is active it must be cleaned up explicitly.
-            log_debug(_MOD, "  Step 1: Releasing any active drag...")
-            self._release_drag_if_active("watchdog hook restart")
-            log_debug(_MOD, "  ✓ Drag released (if was active)")
-            
-            # Stop drag-stop listeners before re-registering to avoid stale refs.
-            log_debug(_MOD, "  Step 2: Stopping drag-stop listeners...")
+            self._release_drag_if_active("native hook recovery")
             self._stop_drag_stop_listeners()
-            log_debug(_MOD, "  ✓ Drag-stop listeners stopped")
-
-            with self._hooks_lock:
-                log_debug(_MOD, "  Step 3: Unregistering existing hotkeys...")
-                self._unregister_hotkeys()
-                
-                log_debug(_MOD, "  Step 4: Resetting heartbeat timestamp...")
-                self._last_heartbeat = time.monotonic()  # reset before re-hook
-                
-                # Re-create mouse controller: pynput state can become invalid
-                # after the OS resumes from hibernation or a fast-user-switch.
-                log_debug(_MOD, "  Step 5: Recreating MouseController...")
-                try:
-                    if _DEPS_AVAILABLE:
-                        old_mouse = self._mouse
-                        self._mouse = MouseController()
-                        log_info(_MOD, "  ✓ MouseController recreated")
-                except Exception as e:
-                    log_error(_MOD, "  ❌ Could not re-create MouseController: %s", str(e), exc_info=True)
-                    raise
-                
-                log_debug(_MOD, "  Step 6: Re-registering hotkeys...")
-                self._register_hotkeys()
-                log_info(_MOD, "  ✓ Hotkeys re-registered")
-            
-            log_info(_MOD, ">>> HOOK RESTART SEQUENCE COMPLETE - SUCCESS")
-            if self._mapping_lost:
-                log_info(_MOD, "✓ Hotkeys have been RECOVERED — keyboard hooks successfully restarted by watchdog.")
+            # Use the exact manual-reset path: targeted re-registration alone
+            # cannot revive a dead Windows low-level hook.
+            reset_function_key_bindings(True, reason="watchdog or resume recovery")
             self._mapping_lost = False
         except Exception as e:
-            log_error(_MOD, "❌ FAILED to restart keyboard hooks in watchdog: %s", str(e), exc_info=True)
+            log_error(_MOD, "❌ Native hook recovery failed: %s", str(e), exc_info=True)
             raise
 
     # ------------------------------------------------------------------
@@ -928,6 +940,9 @@ class KeyboardActionsService:
             return
 
         log_info(_MOD, ">>> REGISTERING ALL HOTKEYS START")
+        self._binding_generation += 1
+        generation = self._binding_generation
+        self._actions_enabled = False
         
         keys = {
             "leftClickKey":   (self._do_left_click,   "F7"),
@@ -938,14 +953,23 @@ class KeyboardActionsService:
 
         registered_count = 0
         for param, (callback, default) in keys.items():
-            key = self._key_for(param, default)
+            # F7-F10 are fixed safety bindings while ErgoProtect is running.
+            key = default
             try:
                 # suppress=True ensures the key event is consumed by ErgoProtect
                 # and is NOT passed through to the currently focused application.
                 # This prevents apps like MS Excel (F7=spell check), VS Code
                 # (F8=next error), etc. from also acting on the same keystroke.
                 log_debug(_MOD, "  Registering hotkey: %s (param=%s)", key, param)
-                handler = kb_lib.add_hotkey(key, callback, suppress=True)
+                # ``callback`` must not run in the low-level Windows hook;
+                # logging and mouse I/O are handled by the worker thread.
+                handler = kb_lib.add_hotkey(
+                    key,
+                    lambda action=callback, binding=generation, hotkey=key: self._enqueue_hook_action(
+                        action, binding, hotkey.upper()
+                    ),
+                    suppress=True,
+                )
                 self._hotkey_handlers.append(handler)
                 hotkey_logger.hotkey_registered(key, callback.__name__)
                 log_info(_MOD, "  ✓ Hotkey registered: %s → %s()", key, callback.__name__)
@@ -964,6 +988,7 @@ class KeyboardActionsService:
             log_error(_MOD, "  ❌ FAILED to register heartbeat hook: %s", str(e), exc_info=True)
 
         self._hotkeys_registered = True
+        self._actions_enabled = registered_count == len(keys)
         log_info(
             _MOD,
             ">>> REGISTERING ALL HOTKEYS COMPLETE - Registered %d/%d action hotkeys, heartbeat %s",
@@ -989,6 +1014,9 @@ class KeyboardActionsService:
             return
 
         log_info(_MOD, ">>> UNREGISTERING ALL HOTKEYS START")
+        # Invalidate queued callbacks before touching keyboard's registrations.
+        self._actions_enabled = False
+        self._binding_generation += 1
         
         # Remove each action hotkey individually.
         removed_count = 0
@@ -1281,38 +1309,41 @@ def get_service() -> KeyboardActionsService | None:
     return _service
 
 
-def reset_function_key_bindings(include_keyboard_actions: bool = True) -> None:
-    """Perform the shared native reset for F6 through F10."""
-    log_info(
-        _MOD,
-        "Function-key reset requested (F7-F10 included=%s).",
-        include_keyboard_actions,
-    )
-    if include_keyboard_actions:
-        if _service is None:
-            log_warning(_MOD, "F7-F10 reset requested but KeyboardActions service is unavailable.")
-        else:
-            _service.force_reregister_all()
-            log_info(_MOD, "F7-F10 were registered on the fresh native hook.")
+def reset_function_key_bindings(
+    include_keyboard_actions: bool = True, reason: str = "manual reset"
+) -> None:
+    """Atomically rebuild the shared native listener and every F6-F10 binding."""
+    with _function_key_reset_lock:
+        log_info(
+            _MOD,
+            "Serialized F6-F10 native reset started (reason=%s, F7-F10=%s).",
+            reason,
+            include_keyboard_actions,
+        )
+        if include_keyboard_actions:
+            if _service is None:
+                log_warning(_MOD, "F7-F10 reset requested but KeyboardActions service is unavailable.")
+            else:
+                _service._rebuild_keyboard_actions_native()
+                log_info(_MOD, "F7-F10 were registered on the fresh native hook.")
 
-    # force_reregister_all replaces keyboard._listener, which invalidates the
-    # stored F6 handler even when remove_hotkey() no longer raises.  Always
-    # clear AutoClick's reference and register F6 after the new listener exists.
-    try:
-        import AutoClick as auto_click_module
-    except ImportError:
+        # Native listener replacement invalidates every keyboard-package
+        # handler, including F6.  Rebind it before releasing the shared lock.
         try:
-            from src import AutoClick as auto_click_module
+            import AutoClick as auto_click_module
         except ImportError:
-            auto_click_module = None
+            try:
+                from src import AutoClick as auto_click_module
+            except ImportError:
+                auto_click_module = None
 
-    auto_click_service = auto_click_module.get_service() if auto_click_module else None
-    if auto_click_service is None:
-        log_warning(_MOD, "F6 reset skipped because the AutoClick service is unavailable.")
-        return
-    auto_click_service._unregister_hotkey()
-    auto_click_service._register_hotkey()
-    log_info(_MOD, "F6 was registered on the fresh native hook.")
+        auto_click_service = auto_click_module.get_service() if auto_click_module else None
+        if auto_click_service is None:
+            log_warning(_MOD, "F6 reset skipped because the AutoClick service is unavailable.")
+            return
+        auto_click_service._unregister_hotkey()
+        auto_click_service._register_hotkey()
+        log_info(_MOD, "Serialized F6-F10 native reset complete.")
 
 
 def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
@@ -1357,7 +1388,8 @@ def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
 
     # --- Enable / Disable toggle (topmost control) -----------------------
     # Read persisted enabled state; default to True for backwards-compat.
-    _enabled_default = config_manager.get_bool("keyboardActions", "enabled", default=True)
+    _enabled_default = True
+    config_manager.set_config("keyboardActions", "enabled", "True")
     enabled_var = tk.BooleanVar(value=_enabled_default)
 
     toggle_frame = ttk.Frame(frame)
@@ -1410,7 +1442,8 @@ def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
         toggle_frame,
         variable=enabled_var,
         command=_on_toggle,
-        text="Active",
+        text="Active while ErgoProtect is running",
+        state="disabled",
     )
     toggle_cb.pack(side="left")
 
@@ -1483,9 +1516,9 @@ def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
 
         # Key entry
         key_var = tk.StringVar(
-            value=config_manager.get_config("keyboardActions", param, default)
+            value=default
         )
-        entry = ttk.Entry(frame, textvariable=key_var, width=10)
+        entry = ttk.Entry(frame, textvariable=key_var, width=10, state="disabled")
         entry.grid(row=row, column=1, sticky="nw", pady=6)
 
         # Description note

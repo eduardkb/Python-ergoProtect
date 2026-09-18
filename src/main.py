@@ -230,7 +230,12 @@ def _shutdown(icon: "pystray.Icon", gui: GraphicalInterface) -> None: # type: ig
     """
     log_info("main", "Shutdown initiated by user.")
 
-    # 1. Stop AutoClick service
+    # 1. Stop both keyboard services before logging shuts down.  This ensures
+    # native F6-F10 hooks and their workers cannot outlive application cleanup.
+    keyboard_service = KeyboardActions.get_service()
+    if keyboard_service:
+        keyboard_service.stop()
+
     service = AutoClick.get_service()
     if service:
         service.stop()

@@ -32,6 +32,7 @@ import math
 import threading
 import time
 import tkinter as tk
+import queue
 from tkinter import ttk
 
 # pynput for mouse control/listening; keyboard lib for exclusive per-key hotkey.
@@ -93,6 +94,17 @@ class AutoClickService:
         # Serialises _register_hotkey()/_unregister_hotkey() so concurrent
         # callers (GUI thread, watchdog thread) can't race on self._hotkey_handler.
         self._hotkey_lock = threading.Lock()
+        # F6 uses a suppressed low-level hook.  Keep its callback limited to
+        # enqueueing so config writes and logging cannot delay Windows' hook.
+        self._hook_action_queue: queue.SimpleQueue = queue.SimpleQueue()
+        self._binding_generation = 0
+        self._hotkey_actions_enabled = False
+        self._hook_action_thread = threading.Thread(
+            target=self._hook_action_loop,
+            name="AutoClickHookWorker",
+            daemon=True,
+        )
+        self._hook_action_thread.start()
 
         # Timestamp of last activation for post-activation cooldown.
         self._activation_time: float = 0.0
@@ -125,6 +137,20 @@ class AutoClickService:
         self._drag_release_logged: bool = False
 
         log_info(_MOD, "Service instance created.")
+
+    def _enqueue_hook_action(self, generation: int) -> None:
+        """Minimal F6 hook callback: schedule work without logging or I/O."""
+        self._hook_action_queue.put_nowait(generation)
+
+    def _hook_action_loop(self) -> None:
+        """Perform F6 state changes outside keyboard's low-level hook."""
+        while True:
+            generation = self._hook_action_queue.get()
+            try:
+                if self._hotkey_actions_enabled and generation == self._binding_generation:
+                    self.toggle()
+            except Exception:
+                log_error(_MOD, "Queued AutoClick hotkey action failed.", exc_info=True)
 
     # ------------------------------------------------------------------
     # Public interface
@@ -247,13 +273,20 @@ class AutoClickService:
                 log_debug(_MOD, "_register_hotkey() guard check - already registered by another thread")
                 return  # already registered by another thread while we waited.
             
-            key = self._cfg.get_config("autoClick", "activate_key", "F6")
+            # F6 remains reserved for AutoClick for the application's lifetime.
+            key = "F6"
             try:
+                self._binding_generation += 1
+                generation = self._binding_generation
+                self._hotkey_actions_enabled = False
                 log_info(_MOD, "=== Registering F6 AutoClick hotkey: %s ===", key)
                 # suppress=True: the keystroke is consumed exclusively by ErgoProtect
                 # and is NOT passed to any other window, application, or Windows itself.
-                self._hotkey_handler = kb_lib.add_hotkey(key, self.toggle, suppress=True)
+                self._hotkey_handler = kb_lib.add_hotkey(
+                    key, lambda binding=generation: self._enqueue_hook_action(binding), suppress=True
+                )
                 self._hotkey_key = key
+                self._hotkey_actions_enabled = True
                 hotkey_logger.hotkey_registered(key, "AutoClick.toggle")
                 log_info(_MOD, "✓ F6 AutoClick hotkey REGISTERED SUCCESSFULLY (suppress=True) for key: %s", key)
             except Exception as e:
@@ -693,6 +726,8 @@ def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
         if new_val:
             log_info(_MOD, "AutoClick Active toggled ON — running shared native function-key reset.")
             try:
+                self._hotkey_actions_enabled = False
+                self._binding_generation += 1
                 import KeyboardActions as _ka_mod
             except ImportError:
                 try:
@@ -747,8 +782,8 @@ def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
     # ----------------------------------------------------------------
     ttk.Label(frame, text="Hotkey:").grid(row=3, column=0, sticky="w", pady=6)
 
-    key_var = tk.StringVar(value=config_manager.get_config("autoClick", "activate_key", "F6"))
-    key_entry = ttk.Entry(frame, textvariable=key_var, width=10)
+    key_var = tk.StringVar(value="F6")
+    key_entry = ttk.Entry(frame, textvariable=key_var, width=10, state="disabled")
     key_entry.grid(row=3, column=1, sticky="w", padx=(8, 0))
 
     def _on_key_change(*_) -> None:
