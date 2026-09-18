@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.0.17] - 2026-09-18
+
+### Fixed
+- **Keyboard Actions – Full key-binding reset**: Resetting key bindings now replaces the underlying Windows keyboard hook and restores fresh function-key shortcuts. Turning Keyboard Actions back on uses the same recovery process, with detailed event logging for troubleshooting.
+
 ## [1.0.16] - 2026-09-18
 
 ### Enhanced

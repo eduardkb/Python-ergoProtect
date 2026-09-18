@@ -93,6 +93,108 @@ except ImportError:
 # Module identifier used in all log calls.
 _MOD = "KeyboardActions"
 
+# The ``keyboard`` package keeps its Windows hook handle private and, in some
+# releases, never passes that handle to UnhookWindowsHookEx.  Keep a record of
+# every handle it creates so a user-requested reset can tear down the actual OS
+# hook instead of merely clearing Python callback lists.
+_native_hook_lock = threading.RLock()
+_native_hook_handles: list = []
+_native_hook_capture_installed = False
+
+
+def _install_native_hook_capture() -> None:
+    """Record Win32 hook handles created by keyboard's Windows backend."""
+    global _native_hook_capture_installed
+    if _native_hook_capture_installed or not _DEPS_AVAILABLE or sys.platform != "win32":
+        return
+    try:
+        import keyboard._winkeyboard as win_keyboard
+
+        original_set_hook = win_keyboard.SetWindowsHookEx
+
+        def _recording_set_hook(*args):
+            handle = original_set_hook(*args)
+            if handle:
+                with _native_hook_lock:
+                    _native_hook_handles.append(handle)
+                log_info(_MOD, "Native SetWindowsHookExW created keyboard hook handle=%s.", handle)
+            else:
+                log_error(_MOD, "Native SetWindowsHookExW failed to create a keyboard hook.")
+            return handle
+
+        win_keyboard.SetWindowsHookEx = _recording_set_hook
+        _native_hook_capture_installed = True
+        log_info(_MOD, "Installed native SetWindowsHookExW hook-handle capture.")
+    except Exception:
+        log_error(_MOD, "Could not install native keyboard-hook capture.", exc_info=True)
+
+
+def _recreate_keyboard_listener() -> None:
+    """Unhook Windows' low-level hook and replace keyboard's listener singleton."""
+    if not _DEPS_AVAILABLE or sys.platform != "win32":
+        log_debug(_MOD, "Native hook reset skipped (not running on Windows or keyboard unavailable).")
+        return
+
+    _install_native_hook_capture()
+    try:
+        import keyboard._winkeyboard as win_keyboard
+    except Exception:
+        log_error(_MOD, "Native hook reset could not load keyboard's Windows backend.", exc_info=True)
+        raise
+
+    with _native_hook_lock:
+        old_listener = getattr(kb_lib, "_listener", None)
+        handles = list(_native_hook_handles)
+        _native_hook_handles.clear()
+
+        # End the old listener's message loop before unhooking it.  The new
+        # singleton below causes add_hotkey/on_press to invoke SetWindowsHookExW
+        # again when the bindings are registered.
+        listener_thread = getattr(old_listener, "listening_thread", None)
+        thread_id = getattr(listener_thread, "native_id", None)
+        if thread_id:
+            try:
+                ctypes.windll.user32.PostThreadMessageW(thread_id, 0x0012, 0, 0)  # WM_QUIT
+                log_info(_MOD, "Posted WM_QUIT to old keyboard listener thread id=%s.", thread_id)
+            except Exception:
+                log_warning(_MOD, "Could not post WM_QUIT to old keyboard listener thread.", exc_info=True)
+
+        unhooked = 0
+        for handle in handles:
+            try:
+                if win_keyboard.UnhookWindowsHookEx(handle):
+                    unhooked += 1
+                    log_info(_MOD, "Native UnhookWindowsHookEx succeeded for handle=%s.", handle)
+                else:
+                    log_warning(_MOD, "Native UnhookWindowsHookEx returned false for handle=%s.", handle)
+            except Exception:
+                log_error(_MOD, "Native UnhookWindowsHookEx failed for handle=%s.", handle, exc_info=True)
+
+        if old_listener is not None:
+            try:
+                old_listener.listening = False
+            except Exception:
+                pass
+            if listener_thread and listener_thread is not threading.current_thread():
+                listener_thread.join(timeout=1.0)
+
+            # Do not reuse the keyboard package's singleton: its handler queues
+            # and OS thread can be stale after sleep, UAC, or a driver reset.
+            kb_lib._listener = type(old_listener)()
+            log_info(
+                _MOD,
+                "Replaced keyboard._listener with a fresh instance after unhooking %d native hook(s).",
+                unhooked,
+            )
+        else:
+            log_warning(_MOD, "keyboard._listener was absent; registrations will create a new listener normally.")
+
+
+# Install this before either UI tab starts the keyboard package listener.  The
+# AutoClick tab is constructed first, so waiting until a reset would be too late
+# to learn the handle of its original F6 hook.
+_install_native_hook_capture()
+
 # ---------------------------------------------------------------------------
 # Watchdog configuration
 # ---------------------------------------------------------------------------
@@ -451,17 +553,17 @@ class KeyboardActionsService:
                 log_debug(_MOD, "  Step 4: Resetting heartbeat...")
                 self._last_heartbeat = time.monotonic()
                 
-                # Explicitly clear the keyboard library's entire hook state to ensure
-                # exclusive bindings are properly restored (suppress=True flag applied).
-                # This is critical when the library is in a corrupted state after
-                # system events (hibernation, screen lock, UAC prompts, etc).
-                log_debug(_MOD, "  Step 5: Clearing ALL keyboard hooks via unhook_all()...")
+                # Rebuild the actual Windows low-level hook, rather than only
+                # clearing keyboard's Python handler lists.  This calls
+                # UnhookWindowsHookEx for tracked hooks and replaces the
+                # keyboard package's singleton so _register_hotkeys creates a
+                # brand-new SetWindowsHookExW hook.
+                log_debug(_MOD, "  Step 5: Recreating the native Windows keyboard hook...")
                 try:
-                    if _DEPS_AVAILABLE:
-                        kb_lib.unhook_all()
-                        log_info(_MOD, "  ✓ All keyboard hooks cleared via unhook_all()")
+                    _recreate_keyboard_listener()
+                    log_info(_MOD, "  ✓ Native keyboard hook teardown and listener replacement complete")
                 except Exception as e:
-                    log_error(_MOD, "  ❌ Could not unhook_all(): %s", str(e), exc_info=True)
+                    log_error(_MOD, "  ❌ Could not recreate native keyboard hook: %s", str(e), exc_info=True)
                     raise
                 
                 log_debug(_MOD, "  Step 6: Recreating MouseController...")
@@ -1176,6 +1278,40 @@ def get_service() -> KeyboardActionsService | None:
     return _service
 
 
+def reset_function_key_bindings(include_keyboard_actions: bool = True) -> None:
+    """Perform the shared native reset for F6 through F10."""
+    log_info(
+        _MOD,
+        "Function-key reset requested (F7-F10 included=%s).",
+        include_keyboard_actions,
+    )
+    if include_keyboard_actions:
+        if _service is None:
+            log_warning(_MOD, "F7-F10 reset requested but KeyboardActions service is unavailable.")
+        else:
+            _service.force_reregister_all()
+            log_info(_MOD, "F7-F10 were registered on the fresh native hook.")
+
+    # force_reregister_all replaces keyboard._listener, which invalidates the
+    # stored F6 handler even when remove_hotkey() no longer raises.  Always
+    # clear AutoClick's reference and register F6 after the new listener exists.
+    try:
+        import AutoClick as auto_click_module
+    except ImportError:
+        try:
+            from src import AutoClick as auto_click_module
+        except ImportError:
+            auto_click_module = None
+
+    auto_click_service = auto_click_module.get_service() if auto_click_module else None
+    if auto_click_service is None:
+        log_warning(_MOD, "F6 reset skipped because the AutoClick service is unavailable.")
+        return
+    auto_click_service._unregister_hotkey()
+    auto_click_service._register_hotkey()
+    log_info(_MOD, "F6 was registered on the fresh native hook.")
+
+
 def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
     """
     Build and return the "Keyboard Actions" settings tab widget.
@@ -1246,25 +1382,9 @@ def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
                         log_warning(_MOD, "Service thread was dead — performing clean restart. Find out why and correct.")
                         _service.stop()
                     _service.start()
-                    # Force re-register ALL function keys (F7–F10) immediately.
-                    _service.force_reregister_all()
-                    # Also re-register F6 (AutoClick hotkey) via AutoClick service.
-                    try:
-                        import AutoClick as _ac_mod
-                    except ImportError:
-                        try:
-                            from src import AutoClick as _ac_mod
-                        except ImportError:
-                            _ac_mod = None
-                    if _ac_mod is not None:
-                        _ac_svc = _ac_mod.get_service()
-                        if _ac_svc is not None:
-                            try:
-                                _ac_svc._unregister_hotkey()
-                                _ac_svc._register_hotkey()
-                                log_info(_MOD, "AutoClick F6 hotkey re-registered from KeyboardActions Active toggle.")
-                            except Exception:
-                                log_error(_MOD, "Failed to re-register AutoClick hotkey from KeyboardActions toggle.", exc_info=True)
+                    # Re-checking uses exactly the same native reset path as
+                    # the Reset Key Bindings button.
+                    reset_function_key_bindings(include_keyboard_actions=True)
                     status_label.config(
                         text="Service running. Hotkeys are active system-wide.",
                         foreground="#228822",
@@ -1421,34 +1541,10 @@ def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
         log_info(_MOD, "Reset Key Bindings clicked — releasing and re-binding function key hooks.")
         keyboard_actions_enabled = enabled_var.get()
 
-        # Release + re-bind F7–F10 (this service's hotkeys) — only if enabled.
-        if keyboard_actions_enabled:
-            if _service:
-                try:
-                    _service.force_reregister_all()
-                    log_info(_MOD, "Keyboard Actions F7–F10 hotkeys reset.")
-                except Exception:
-                    log_error(_MOD, "Failed to reset Keyboard Actions hotkeys.", exc_info=True)
-        else:
-            log_info(_MOD, "Keyboard Actions is disabled — skipping F7–F10 reset.")
-
-        # Release + re-bind F6 (AutoClick hotkey) via AutoClick service — always.
         try:
-            import AutoClick as _ac_mod
-        except ImportError:
-            try:
-                from src import AutoClick as _ac_mod
-            except ImportError:
-                _ac_mod = None
-        if _ac_mod is not None:
-            _ac_svc = _ac_mod.get_service()
-            if _ac_svc is not None:
-                try:
-                    _ac_svc._unregister_hotkey()
-                    _ac_svc._register_hotkey()
-                    log_info(_MOD, "AutoClick F6 hotkey reset.")
-                except Exception:
-                    log_error(_MOD, "Failed to reset AutoClick hotkey.", exc_info=True)
+            reset_function_key_bindings(include_keyboard_actions=keyboard_actions_enabled)
+        except Exception:
+            log_error(_MOD, "Failed to reset function-key bindings.", exc_info=True)
 
         if _DEPS_AVAILABLE:
             if keyboard_actions_enabled:
