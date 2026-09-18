@@ -1,5 +1,9 @@
 # Next ToDo's
-- Problems
+- Problems    
+    3. Move any logging/disk I/O out of the hook callback path itself (log via a queue processed on a separate thread) so the callback always returns fast, keeping it under the eviction timeout.
+    
+
+
     - on .exe file location, inside log folder, files older than 30 days are not being deleted
 
 - Bugs:

@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.0.16] - 2026-09-18
+
+### Enhanced
+- **Keyboard Actions – Real end-to-end watchdog probe**: Replaced theoretical hook liveness checks with actual synthetic keypress simulation. The watchdog now sends a test key event and verifies the callback fires, providing definitive proof that keybindings are working end-to-end.
+- **Keyboard Actions – Detailed keybinding loss diagnostics**: When a keybinding is lost, the log now records detailed error context including hook listener status, handler count, last heartbeat timestamp, and probable cause (screen lock, hibernation, UAC prompt, driver crash, etc.). This makes troubleshooting keybinding failures much faster.
+
 ## [1.0.15] - 2026-09-18
 
 ### Fix

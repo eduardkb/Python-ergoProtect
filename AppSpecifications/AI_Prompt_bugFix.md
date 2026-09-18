@@ -1,13 +1,12 @@
-Modify Python application code attached as app.zip.
+Modify Python application code attached as a project.
 use as few AI resources as possible.
 don't write text explaining the code. while it is being written.
 priority is to generate the code as per requirements below.
-Always zip only the files that needed to be modified (keeping the folder structure) to the results.zip file and let me download it.
 
 ====================
 Requirements:
-- The newly added "Reset Key Bindings" button does not work. When the exclusive key bindings are lost (and they are lost frequently) this button does not restore the binding exclusively to this application. Fix this.
-
+- Make "Reset Key Bindings" button actually call UnhookWindowsHookEx and reinstall a fresh SetWindowsHookExW  hook from scratch (bypassing the keyboard library's internal singleton, or forcing it to re-create its _listener), instead of only clearing Python-side handler lists. Make the app create completely new hooks for the function keys (F6 through F10) and cleanup old hooks if needed.  When user un-checks and checks the "Enable Keyboard Actions" checkbox again, it should also call the same function the button above does besides doint what it is normally already doing. 
+- Logging: using the logging engine already coded, implement verbose logging of all important events.
 
 ======================
 On every modification also:

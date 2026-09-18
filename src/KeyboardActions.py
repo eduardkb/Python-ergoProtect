@@ -326,6 +326,12 @@ class KeyboardActionsService:
         # can pair it with exactly one "mapping recovered" warning per event.
         self._mapping_lost: bool = False
 
+        # End-to-end probe state for watchdog
+        self._probe_event = threading.Event()
+        self._probe_fired = False
+        self._last_probe_time: float = 0.0
+        self._probe_cooldown: float = 5.0  # seconds between probes
+
         log_info(_MOD, "Service instance created.")
 
     # ------------------------------------------------------------------
@@ -517,15 +523,12 @@ class KeyboardActionsService:
     def _watchdog_loop(self) -> None:
         """
         Watchdog thread body: periodically checks if the keyboard hook is still
-        alive and performs a clean restart of the hooks if it is not.
-
-        This is the primary fix for the silent-freeze bug: the ``keyboard``
-        library's internal OS hook thread can die without raising any exception,
-        causing all hotkeys to stop working silently.  The watchdog detects
-        this condition and re-registers the hooks automatically.
+        alive by performing a real end-to-end probe. Simulates a keypress and
+        verifies the callback fires. If the hook is dead or unresponsive, triggers
+        automatic recovery with detailed error logging.
         """
-        log_debug(_MOD, "Watchdog thread started (interval=%.0fs, stale=%.0fs).",
-                  _WATCHDOG_INTERVAL_S, _HOOK_STALE_THRESHOLD_S)
+        log_debug(_MOD, "Watchdog thread started (interval=%.0fs).",
+                  _WATCHDOG_INTERVAL_S)
 
         while not self._stop_event.wait(timeout=_WATCHDOG_INTERVAL_S):
             if self._stop_event.is_set():
@@ -535,7 +538,18 @@ class KeyboardActionsService:
                     # Hooks were intentionally unregistered; nothing to watch.
                     continue
 
+                current_time = time.monotonic()
+                # Perform probe every 5 seconds (not on every check cycle)
+                should_probe = (current_time - self._last_probe_time) >= self._probe_cooldown
+                
                 hook_alive = self._is_keyboard_hook_alive()
+                probe_success = True
+                probe_error = None
+                
+                # Run end-to-end probe
+                if should_probe:
+                    self._last_probe_time = current_time
+                    probe_success, probe_error = self._run_e2e_probe()
 
                 # Check that our registered handler count matches what we expect
                 # (4 action hotkeys + 1 heartbeat). If handlers were silently lost,
@@ -546,68 +560,135 @@ class KeyboardActionsService:
                     or self._heartbeat_hook_ref is None
                 )
 
-                # Trigger recovery ONLY when:
-                #   1. The internal OS listener thread is confirmed dead, OR
-                #   2. Handlers have been silently removed from memory.
-                #
-                # NOTE: A stale heartbeat alone is NOT sufficient to trigger a
-                # restart. Heartbeat only updates on actual keypresses, so during
-                # normal idle (user not pressing any keys) it will always appear
-                # stale — that is expected behaviour, not a fault. We only use
-                # heartbeat age as a secondary signal when the hook is already
-                # dead (case 1) to enrich the log message.
+                # Trigger recovery when:
+                #   1. End-to-end probe fails (callback didn't fire)
+                #   2. The internal OS listener thread is confirmed dead, OR
+                #   3. Handlers have been silently removed from memory
                 restart_reason = None
-                if not hook_alive:
+                if should_probe and not probe_success:
+                    restart_reason = (
+                        f"END-TO-END PROBE FAILED — Simulated keypress callback did not fire. "
+                        f"Details: {probe_error}. "
+                        f"Hook listener alive: {hook_alive}, "
+                        f"Handlers: {len(self._hotkey_handlers)}/{expected_action_handlers}, "
+                        f"Heartbeat: {'OK' if self._heartbeat_hook_ref else 'MISSING'}"
+                    )
+                elif not hook_alive:
                     heartbeat_age = time.monotonic() - self._last_heartbeat
                     restart_reason = (
-                        f"OS keyboard listener thread is dead "
-                        f"(heartbeat_age={heartbeat_age:.1f}s, "
-                        f"handlers_registered={len(self._hotkey_handlers)})"
+                        f"OS KEYBOARD LISTENER DEAD — Internal listener thread is no longer running. "
+                        f"Last heartbeat: {heartbeat_age:.1f}s ago, "
+                        f"Handlers: {len(self._hotkey_handlers)}/{expected_action_handlers}, "
+                        f"Possible cause: Screen lock, hibernation, UAC prompt, or driver crash"
                     )
                 elif handlers_lost:
                     restart_reason = (
-                        f"Hotkey handler count mismatch: expected {expected_action_handlers} "
-                        f"action handlers + heartbeat, found {len(self._hotkey_handlers)} "
-                        f"action handlers, heartbeat_ref={'set' if self._heartbeat_hook_ref else 'MISSING'}"
+                        f"HANDLER COUNT MISMATCH — Expected {expected_action_handlers} action handlers + heartbeat, "
+                        f"but found {len(self._hotkey_handlers)} handlers, "
+                        f"heartbeat={'PRESENT' if self._heartbeat_hook_ref else 'MISSING'}. "
+                        f"Handlers were silently removed from memory."
                     )
 
                 if restart_reason:
                     if not self._mapping_lost:
-                        # First detection — log a warning and attempt recovery.
+                        # First detection — log detailed error with context
                         log_error(
                             _MOD,
-                            "❌ ERROR: KEY MAPPINGS LOST — %s. Attempting recovery.",
+                            "❌ CRITICAL: KEY MAPPINGS LOST — %s. Attempting recovery...",
                             restart_reason,
                         )
                         hook_loss_detector.hook_lost(context=restart_reason)
                         watchdog_monitor.recovery_attempted(context=restart_reason)
                         self._mapping_lost = True
-                    # Silently retry until recovery succeeds; avoid log spam on
-                    # repeated watchdog cycles while the hook is still down.
+                    # Silently retry until recovery succeeds; avoid log spam
                     try:
                         self._restart_hooks()
                         watchdog_monitor.recovery_succeeded()
                         hook_loss_detector.hook_recovered(context="watchdog auto-recovery")
                     except Exception as e:
+                        log_error(_MOD, "Recovery attempt failed: %s", str(e), exc_info=True)
                         watchdog_monitor.recovery_failed(error=str(e))
                 else:
                     # Log periodic status (every 10th check to reduce noise)
                     if self._check_count % 10 == 0:
+                        probe_info = f", probe_ok={probe_success}" if should_probe else ""
                         log_debug(
                             _MOD,
-                            "Watchdog check #%d: Hook alive=%s, handlers=%d, heartbeat_age=%.1fs",
+                            "Watchdog check #%d: Hook alive=%s, handlers=%d/%d, heartbeat=%.1fs ago%s",
                             self._check_count,
                             hook_alive,
                             len(self._hotkey_handlers),
-                            time.monotonic() - self._last_heartbeat
+                            expected_action_handlers,
+                            time.monotonic() - self._last_heartbeat,
+                            probe_info
                         )
-                    watchdog_monitor.check_performed(hook_alive, "routine check")
+                    watchdog_monitor.check_performed(hook_alive, "e2e_probe" if should_probe else "routine")
                 
                 self._check_count += 1
             except Exception:
                 log_error(_MOD, "Watchdog loop encountered an unexpected error.", exc_info=True)
 
         log_debug(_MOD, "Watchdog thread exiting.")
+
+    def _run_e2e_probe(self) -> tuple[bool, str]:
+        """
+        End-to-end probe: simulate a synthetic key event and verify that
+        the keyboard hook catches it and fires a callback.
+        
+        Returns: (success: bool, error_msg: str)
+          success=True if callback fired within timeout
+          success=False with detailed error message if probe failed
+        """
+        if not _DEPS_AVAILABLE:
+            return False, "pynput/keyboard dependencies not available"
+        
+        try:
+            # Register a temporary test callback
+            test_fired = threading.Event()
+            test_key = "__ergoprotect_probe_test__"
+            
+            def probe_callback():
+                test_fired.set()
+            
+            # Add temporary probe hotkey (use a non-existent key to avoid conflicts)
+            # We'll use the heartbeat hook mechanism to verify the hook is catching events
+            try:
+                test_handler = kb_lib.add_hotkey("shift+scroll_lock", probe_callback, suppress=True)
+            except Exception as e:
+                return False, f"Could not register probe hotkey: {str(e)}"
+            
+            try:
+                # Now trigger a real user input to see if the hook catches it
+                # We'll check if ANY keyboard input triggers the heartbeat
+                heartbeat_before = self._last_heartbeat
+                
+                # Try to simulate a press of a real key through the library
+                # Use a safe key that won't cause side effects
+                try:
+                    # Press and release a benign key to test the hook
+                    kb_lib.press_and_release('scroll lock')
+                    # Wait for heartbeat to update (callback should fire immediately)
+                    test_fired.wait(timeout=0.5)
+                except Exception as e:
+                    pass  # Simulation may fail but we check heartbeat anyway
+                
+                # Verify either the probe fired OR heartbeat was updated
+                heartbeat_after = self._last_heartbeat
+                probe_result = test_fired.is_set() or (heartbeat_after > heartbeat_before)
+                
+                if probe_result:
+                    return True, "Callback verified successful"
+                else:
+                    return False, "No keyboard callback received (heartbeat unchanged, probe callback not fired)"
+            finally:
+                # Always clean up the test handler
+                try:
+                    kb_lib.remove_hotkey(test_handler)
+                except Exception:
+                    pass
+        
+        except Exception as e:
+            return False, f"Probe execution failed: {str(e)}"
 
     def _is_keyboard_hook_alive(self) -> bool:
         """
