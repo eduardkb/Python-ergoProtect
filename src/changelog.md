@@ -1,6 +1,11 @@
 # Changelog
 
-## [1.0.14] - 2026-07-31
+## [1.0.15] - 2026-09-18
+
+### Fix
+- **Identation bug
+
+## [1.0.14] - 2026-09-18
 
 ### Adding logging
 - **"Key Bindings" Added logging

@@ -834,7 +834,7 @@ class KeyboardActionsService:
             ">>> UNREGISTERING ALL HOTKEYS COMPLETE - Removed %d action hotkeys",
             removed_count
         )
-            self._heartbeat_hook_ref = None
+        self._heartbeat_hook_ref = None
 
         self._hotkeys_registered = False
         log_debug(_MOD, "All hotkeys unregistered.")
