@@ -1442,8 +1442,8 @@ def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
         toggle_frame,
         variable=enabled_var,
         command=_on_toggle,
-        text="Active while ErgoProtect is running",
-        state="disabled",
+        text="Active",
+        state="normal",
     )
     toggle_cb.pack(side="left")
 
@@ -1518,7 +1518,7 @@ def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
         key_var = tk.StringVar(
             value=default
         )
-        entry = ttk.Entry(frame, textvariable=key_var, width=10, state="disabled")
+        entry = ttk.Entry(frame, textvariable=key_var, width=10, state="normal")
         entry.grid(row=row, column=1, sticky="nw", pady=6)
 
         # Description note

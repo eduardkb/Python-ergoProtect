@@ -5,25 +5,10 @@ priority is to generate the code as per requirements below.
 
 ====================
 Requirements:
- - when exiting through the tray icon exit option I get exeption below although the app exits. ( the exit button on the general tab works and does not display this error)
-            PS C:\Users\eduard\dev\Python-ergoProtect\src> python .\main.py
-            Exception in Tkinter callback
-            Traceback (most recent call last):
-            File "C:\Python314\Lib\tkinter\__init__.py", line 2093, in __call__
-                return self.func(*args)
-                    ~~~~~~~~~^^^^^^^
-            File "C:\Python314\Lib\tkinter\__init__.py", line 876, in callit
-                func(*args, **kw)
-                ~~~~^^^^^^^^^^^^^
-            File "C:\Users\eduard\dev\Python-ergoProtect\src\main.py", line 217, in <lambda>
-                gui.root.after(0, lambda: _shutdown(icon, gui))
-                                        ~~~~~~~~~^^^^^^^^^^^
-            File "C:\Users\eduard\dev\Python-ergoProtect\src\main.py", line 249, in _shutdown
-                keyboard_service.stop()
-                ~~~~~~~~~~~~~~~~~~~~~^^
-            File "C:\Users\eduard\dev\Python-ergoProtect\src\KeyboardActions.py", line 554, in stop
-                self._stop_drag_mouse_listener()
-                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+- When Checkbox with text "Active" named "Enable Keyboard Actions" in tab "Keyboard Actions" is pressed, it correctly removes the exclusive hook bound to the app of all function keys (F6 through F10). however, when clicked again to re-create the hooks, it re-creates just the hooks for F7 through F6. make it reset the F6 hook as well.
+    - Make sure that when this checkbox gets checked, all hooks are removed and completely new ones on a operating system level are re-created from scratch. Do the exact same when the button "Reset Key Bindings" is pressed. If this button is pressed, besides creating completely new handles for F6 through F10, check the "Enable Keyboard Actuions" checkbox if it is un-checked.
+    - F6 hotkey box is grayed out. Make it editable again.
+
 ======================
 On every modification also:
 - Inside file "GraphicalInterface.py" update the variable "APP_VERSION" so that the Major and minor number stay the same but the patch number is increased by 1. (1.0.7 to 1.0.8)

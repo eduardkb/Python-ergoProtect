@@ -1,1 +1,0 @@
-# ErgoProtect – src package marker

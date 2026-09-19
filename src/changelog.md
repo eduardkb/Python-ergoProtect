@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.0.27] - 2026-09-19
+
+### Fixed
+- **Keyboard Actions tab**: Enabled all function key assignment options that were previously grayed out. Users can now modify or disable keyboard shortcuts as needed.
+
 ## [1.0.26] - 2026-09-19
 
 ### Fixed
