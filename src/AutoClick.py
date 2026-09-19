@@ -28,7 +28,9 @@ Why left-click only?
   A left-click is the most common interaction and the safest automatic action.
 """
 
+import importlib
 import math
+import sys
 import threading
 import time
 import tkinter as tk
@@ -273,25 +275,27 @@ class AutoClickService:
                 log_debug(_MOD, "_register_hotkey() guard check - already registered by another thread")
                 return  # already registered by another thread while we waited.
             
-            # F6 remains reserved for AutoClick for the application's lifetime.
-            key = "F6"
-            try:
-                self._binding_generation += 1
-                generation = self._binding_generation
-                self._hotkey_actions_enabled = False
-                log_info(_MOD, "=== Registering F6 AutoClick hotkey: %s ===", key)
-                # suppress=True: the keystroke is consumed exclusively by ErgoProtect
-                # and is NOT passed to any other window, application, or Windows itself.
-                self._hotkey_handler = kb_lib.add_hotkey(
-                    key, lambda binding=generation: self._enqueue_hook_action(binding), suppress=True
-                )
-                self._hotkey_key = key
-                self._hotkey_actions_enabled = True
-                hotkey_logger.hotkey_registered(key, "AutoClick.toggle")
-                log_info(_MOD, "✓ F6 AutoClick hotkey REGISTERED SUCCESSFULLY (suppress=True) for key: %s", key)
-            except Exception as e:
-                self._hotkey_handler = None
-                log_error(_MOD, "❌ ERROR: Could not register F6 hotkey '%s': %s", key, str(e), exc_info=True)
+            configured = (self._cfg.get_config("autoClick", "activate_key", "F6") or "F6").strip() or "F6"
+            candidates = [configured] if configured.upper() == "F6" else [configured, "F6"]
+            for key in candidates:
+                try:
+                    self._binding_generation += 1
+                    generation = self._binding_generation
+                    self._hotkey_actions_enabled = False
+                    log_info(_MOD, "=== Registering AutoClick hotkey: %s ===", key)
+                    # suppress=True: the keystroke is consumed exclusively by ErgoProtect
+                    # and is NOT passed to any other window, application, or Windows itself.
+                    self._hotkey_handler = kb_lib.add_hotkey(
+                        key, lambda binding=generation: self._enqueue_hook_action(binding), suppress=True
+                    )
+                    self._hotkey_key = key
+                    self._hotkey_actions_enabled = True
+                    hotkey_logger.hotkey_registered(key, "AutoClick.toggle")
+                    log_info(_MOD, "AutoClick hotkey REGISTERED (suppress=True) for key: %s", key)
+                    break
+                except Exception:
+                    self._hotkey_handler = None
+                    log_error(_MOD, "Could not register AutoClick hotkey '%s'.", key, exc_info=True)
 
     def _unregister_hotkey(self) -> None:
         """
@@ -725,15 +729,16 @@ def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
         # F7–F10 via KeyboardActions) to recover any lost hooks immediately.
         if new_val:
             log_info(_MOD, "AutoClick Active toggled ON — running shared native function-key reset.")
-            try:
-                self._hotkey_actions_enabled = False
-                self._binding_generation += 1
-                import KeyboardActions as _ka_mod
-            except ImportError:
+            _ka_mod = None
+            for _name in ("src.KeyboardActions", "KeyboardActions"):
+                _ka_mod = sys.modules.get(_name)
+                if _ka_mod is not None:
+                    break
+            if _ka_mod is None:
                 try:
-                    from src import KeyboardActions as _ka_mod
+                    _ka_mod = importlib.import_module("src.KeyboardActions")
                 except ImportError:
-                    _ka_mod = None
+                    log_error(_MOD, "KeyboardActions module not found - function-key reset skipped.")
             if _ka_mod is not None:
                 try:
                     _ka_mod.reset_function_key_bindings(include_keyboard_actions=True)
@@ -782,19 +787,45 @@ def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
     # ----------------------------------------------------------------
     ttk.Label(frame, text="Hotkey:").grid(row=3, column=0, sticky="w", pady=6)
 
-    key_var = tk.StringVar(value="F6")
-    key_entry = ttk.Entry(frame, textvariable=key_var, width=10, state="disabled")
+    key_var = tk.StringVar(
+        value=(config_manager.get_config("autoClick", "activate_key", "F6") or "F6").strip() or "F6"
+    )
+    key_entry = ttk.Entry(frame, textvariable=key_var, width=10)
     key_entry.grid(row=3, column=1, sticky="w", padx=(8, 0))
 
     def _on_key_change(*_) -> None:
+        if not _service:
+            return
+        current = _service._hotkey_key or "F6"
         new_key = key_var.get().strip()
-        if not new_key:
+        if not new_key or new_key.lower() == current.lower():
+            key_var.set(current)
+            return
+        if new_key.lower() in ("f7", "f8", "f9", "f10"):
+            log_warning(_MOD, "Hotkey '%s' rejected: reserved by Keyboard Actions.", new_key)
+            status_var.set(f"'{new_key}' is reserved by Keyboard Actions.")
+            key_var.set(current)
+            return
+        try:
+            if _DEPS_AVAILABLE:
+                kb_lib.parse_hotkey(new_key)
+        except Exception:
+            log_warning(_MOD, "Hotkey '%s' rejected: not a valid key name.", new_key, exc_info=True)
+            status_var.set(f"'{new_key}' is not a valid key name.")
+            key_var.set(current)
             return
         config_manager.set_config("autoClick", "activate_key", new_key)
-        if _service:
-            _service._unregister_hotkey()
-            _service._register_hotkey()
+        _service._unregister_hotkey()
+        _service._register_hotkey()
+        actual = _service._hotkey_key or "F6"
+        if actual.lower() != new_key.lower():
+            log_warning(_MOD, "Hotkey '%s' could not be registered; fell back to '%s'.", new_key, actual)
+            config_manager.set_config("autoClick", "activate_key", actual)
+            key_var.set(actual)
+            status_var.set(f"Could not use '{new_key}'; using '{actual}'.")
+        else:
             log_info(_MOD, "Hotkey updated to: %s", new_key)
+            status_var.set("Service running.")
 
     key_entry.bind("<FocusOut>", _on_key_change)
     key_entry.bind("<Return>", _on_key_change)

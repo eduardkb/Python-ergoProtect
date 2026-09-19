@@ -1,5 +1,27 @@
 # Changelog
 
+## [1.0.30] - 2026-09-19
+
+### Fixed
+- **Keyboard Actions – Power-event watcher**: Fixed an error logged when the watcher shut down (Windows handle sizing issue).
+- **Keyboard Actions – Re-enabling**: Re-enabling after switching it off no longer logs a misleading "service thread was dead" warning; the warning now appears only for unexpected failures.
+
+## [1.0.29] - 2026-09-19
+
+### Fixed
+- **F6 hotkey after re-enabling Keyboard Actions / Reset Key Bindings**: F6 is now correctly re-created together with F7-F10.
+- **Logging**: Warnings and errors were being dropped at the default log level; they are now written to the log file. Unhandled errors (including those in background threads and window callbacks) are now logged too.
+- **AutoClick tab**: The toggle no longer raises an error when switched on.
+
+### Improved
+- **AutoClick tab**: The "Hotkey" field is now editable (F7-F10 are reserved for Keyboard Actions).
+
+## [1.0.28] - 2026-09-19
+
+### Fixed
+- **Keyboard Actions – Re-enabling / Reset Key Bindings**: F6 through F10 are now all removed and re-created from scratch when Keyboard Actions is re-enabled, and the background keyboard error that appeared afterwards is gone.
+- **Reset Key Bindings**: Now also turns on "Enable Keyboard Actions" if it was off.
+
 ## [1.0.27] - 2026-09-19
 
 ### Fixed

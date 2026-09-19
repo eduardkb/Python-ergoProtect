@@ -1,4 +1,4 @@
-APP_VERSION = "1.0.27"
+APP_VERSION = "1.0.30"
 """
 GraphicalInterface.py - Main Application Window for ErgoProtect
 ----------------------------------------------------------------
@@ -34,6 +34,7 @@ from tkinter import messagebox, ttk
 from typing import Optional
 
 from src.AppLogging import (
+    log_uncaught,
     log_debug,
     log_error,
     log_info,
@@ -95,6 +96,9 @@ class GraphicalInterface:
         self._icon_path = icon_path    # str path to .ico or None
         self._on_exit = on_exit
         self._root = tk.Tk()
+        self._root.report_callback_exception = lambda et, ev, tb: log_uncaught(
+            _MOD, "Unhandled exception in a Tk callback.", et, ev, tb
+        )
         self._configure_window()
         self._build_tabs()
         log_info(_MOD, "GraphicalInterface initialised.")

@@ -53,6 +53,7 @@ joints, directly supporting users at risk of or recovering from tendinitis
 and Musculoskeletal Disorders.
 """
 
+import importlib
 import sys
 import threading
 import time
@@ -127,6 +128,18 @@ def _install_native_hook_capture() -> None:
             return handle
 
         win_keyboard.SetWindowsHookEx = _recording_set_hook
+
+        # keyboard's own listen() passes a NULL MSG pointer to GetMessage, which
+        # raises an access violation as soon as WM_QUIT is delivered.  Use a real
+        # MSG buffer so a listener thread can be shut down cleanly.
+        def _safe_listen(callback):
+            win_keyboard.prepare_intercept(callback)
+            msg = win_keyboard.MSG()
+            while win_keyboard.GetMessage(ctypes.byref(msg), 0, 0, 0) > 0:
+                win_keyboard.TranslateMessage(ctypes.byref(msg))
+                win_keyboard.DispatchMessage(ctypes.byref(msg))
+
+        win_keyboard.listen = _safe_listen
         _native_hook_capture_installed = True
         log_info(_MOD, "Installed native SetWindowsHookExW hook-handle capture.")
     except Exception:
@@ -303,7 +316,7 @@ class _PowerEventWatcher:
                         try:
                             self._on_resume()
                         except Exception:
-                            pass
+                            log_error(_MOD, "Power-resume callback failed.", exc_info=True)
                 return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
             wnd_proc = WndProcType(_wnd_proc)
@@ -323,11 +336,21 @@ class _PowerEventWatcher:
                 ]
             })
 
+            # Without explicit types ctypes treats handles as 32-bit ints, which
+            # truncates GetModuleHandleW and overflows UnregisterClassW.
+            kernel32 = ctypes.windll.kernel32
+            kernel32.GetModuleHandleW.argtypes = [ctypes.wintypes.LPCWSTR]
+            kernel32.GetModuleHandleW.restype = ctypes.c_void_p
+            user32.DestroyWindow.argtypes = [ctypes.c_void_p]
+            user32.DestroyWindow.restype = ctypes.wintypes.BOOL
+            user32.UnregisterClassW.argtypes = [ctypes.wintypes.LPCWSTR, ctypes.c_void_p]
+            user32.UnregisterClassW.restype = ctypes.wintypes.BOOL
+
             class_name = "ErgoProtectPowerWatcher"
             wc = WNDCLASSW()
             wc.lpfnWndProc = wnd_proc
             wc.lpszClassName = class_name
-            wc.hInstance = ctypes.windll.kernel32.GetModuleHandleW(None)
+            wc.hInstance = kernel32.GetModuleHandleW(None)
 
             ctypes.windll.user32.RegisterClassW(ctypes.byref(wc))
 
@@ -369,8 +392,8 @@ class _PowerEventWatcher:
                     self._stop_event.wait(timeout=0.1)
 
             if hwnd:
-                ctypes.windll.user32.DestroyWindow(hwnd)
-            ctypes.windll.user32.UnregisterClassW(class_name, wc.hInstance)
+                user32.DestroyWindow(hwnd)
+            user32.UnregisterClassW(class_name, wc.hInstance)
         except Exception:
             log_error(_MOD, "PowerEventWatcher thread failed.", exc_info=True)
 
@@ -1309,10 +1332,37 @@ def get_service() -> KeyboardActionsService | None:
     return _service
 
 
+def _get_autoclick_service():
+    """Return the running AutoClick service (owner of the F6 hook) or None.
+
+    The running app loads the module as ``src.AutoClick``; a plain
+    ``import AutoClick`` can create a second, empty copy, so already-loaded
+    modules are checked first.
+    """
+    names = ("src.AutoClick", "AutoClick")
+    for name in names:
+        module = sys.modules.get(name)
+        service = module.get_service() if module is not None else None
+        if service is not None:
+            return service
+    for name in names:
+        try:
+            service = importlib.import_module(name).get_service()
+        except ImportError:
+            continue
+        except Exception:
+            log_error(_MOD, "Could not load %s to find the F6 service.", name, exc_info=True)
+            continue
+        if service is not None:
+            return service
+    log_error(_MOD, "AutoClick service not found - F6 hook cannot be reset.")
+    return None
+
+
 def reset_function_key_bindings(
     include_keyboard_actions: bool = True, reason: str = "manual reset"
 ) -> None:
-    """Atomically rebuild the shared native listener and every F6-F10 binding."""
+    """Remove every F6-F10 hook and re-create all of them from scratch."""
     with _function_key_reset_lock:
         log_info(
             _MOD,
@@ -1320,29 +1370,29 @@ def reset_function_key_bindings(
             reason,
             include_keyboard_actions,
         )
-        if include_keyboard_actions:
-            if _service is None:
-                log_warning(_MOD, "F7-F10 reset requested but KeyboardActions service is unavailable.")
-            else:
-                _service._rebuild_keyboard_actions_native()
-                log_info(_MOD, "F7-F10 were registered on the fresh native hook.")
-
-        # Native listener replacement invalidates every keyboard-package
-        # handler, including F6.  Rebind it before releasing the shared lock.
+        auto_click_service = _get_autoclick_service()
+        # F7-F10 stay off while Keyboard Actions is disabled (service stopped).
+        if include_keyboard_actions and _service is not None and not (
+            _service._thread and _service._thread.is_alive()
+        ):
+            log_warning(_MOD, "F7-F10 reset skipped because Keyboard Actions is disabled.")
+            include_keyboard_actions = False
         try:
-            import AutoClick as auto_click_module
-        except ImportError:
-            try:
-                from src import AutoClick as auto_click_module
-            except ImportError:
-                auto_click_module = None
-
-        auto_click_service = auto_click_module.get_service() if auto_click_module else None
-        if auto_click_service is None:
-            log_warning(_MOD, "F6 reset skipped because the AutoClick service is unavailable.")
-            return
-        auto_click_service._unregister_hotkey()
-        auto_click_service._register_hotkey()
+            # F6 is removed before the native hook is torn down.
+            if auto_click_service is not None:
+                auto_click_service._unregister_hotkey()
+            if include_keyboard_actions:
+                if _service is None:
+                    log_warning(_MOD, "F7-F10 reset requested but KeyboardActions service is unavailable.")
+                else:
+                    _service._rebuild_keyboard_actions_native()
+                    log_info(_MOD, "F7-F10 were registered on the fresh native hook.")
+        finally:
+            # F6 is always re-created on the fresh hook, even if F7-F10 failed.
+            if auto_click_service is not None:
+                auto_click_service._register_hotkey()
+                if auto_click_service._hotkey_handler is None:
+                    log_error(_MOD, "F6 AutoClick hotkey could not be re-registered after reset.")
         log_info(_MOD, "Serialized F6-F10 native reset complete.")
 
 
@@ -1413,7 +1463,8 @@ def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
                     # stop() cleans up residual state before start() spawns fresh threads.
                     service_dead = _service._thread and not _service._thread.is_alive()
                     watchdog_dead = _service._watchdog_thread and not _service._watchdog_thread.is_alive()
-                    if service_dead or watchdog_dead:
+                    intentionally_stopped = _service._stop_event.is_set()
+                    if (service_dead or watchdog_dead) and not intentionally_stopped:
                         log_warning(_MOD, "Service thread was dead — performing clean restart. Find out why and correct.")
                         _service.stop()
                     _service.start()
@@ -1431,6 +1482,9 @@ def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
             if _service:
                 try:
                     _service.stop()
+                    _ac = _get_autoclick_service()
+                    if _ac is not None:
+                        _ac._unregister_hotkey()
                     status_label.config(
                         text="Service stopped. Hotkeys are inactive.",
                         foreground="#cc4444",
@@ -1575,24 +1629,21 @@ def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
         key — so it is always safe to reset.
         """
         log_info(_MOD, "Reset Key Bindings clicked — releasing and re-binding function key hooks.")
-        keyboard_actions_enabled = enabled_var.get()
-
         try:
-            reset_function_key_bindings(include_keyboard_actions=keyboard_actions_enabled)
+            if not enabled_var.get():
+                # Also turns the feature back on (config, service, full F6-F10 reset).
+                enabled_var.set(True)
+                _on_toggle()
+            else:
+                reset_function_key_bindings(include_keyboard_actions=True, reason="Reset Key Bindings button")
         except Exception:
             log_error(_MOD, "Failed to reset function-key bindings.", exc_info=True)
 
         if _DEPS_AVAILABLE:
-            if keyboard_actions_enabled:
-                status_label.config(
-                    text="Key bindings reset. Hotkeys re-bound to ErgoProtect.",
-                    foreground="#228822",
-                )
-            else:
-                status_label.config(
-                    text="F6 hotkey reset. Enable Keyboard Actions to also reset F7–F10.",
-                    foreground="#cc8800",
-                )
+            status_label.config(
+                text="Key bindings reset. Hotkeys re-bound to ErgoProtect.",
+                foreground="#228822",
+            )
 
     ttk.Button(
         frame, text="Reset Key Bindings", command=_on_reset_key_bindings

@@ -134,7 +134,7 @@ def _release_single_instance_lock() -> None:
 
 from src.generate_icon import make_icon as _make_icon
 from src.config_manager import ConfigManager
-from src.AppLogging import init_logging, cleanup_old_logs, log_info, log_error, shutdown_logging, get_log_dir
+from src.AppLogging import install_exception_logging, init_logging, cleanup_old_logs, log_info, log_error, shutdown_logging, get_log_dir
 from src.GraphicalInterface import GraphicalInterface
 
 from src import AutoClick
@@ -302,6 +302,7 @@ def main() -> None:
     config_manager.set_config("General", "log_level", str(log_level))
 
     init_logging(log_dir=log_dir, days_to_keep=days_to_keep, log_level=log_level)
+    install_exception_logging()
 
     # Persist the resolved app_logs directory if the setting was absent.
     if not log_dir:

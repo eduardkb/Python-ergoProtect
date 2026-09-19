@@ -49,6 +49,7 @@ import queue
 import sys
 import threading
 import traceback
+import warnings
 from typing import Optional
 
 # ---------------------------------------------------------------------------
@@ -355,7 +356,7 @@ def _enqueue(level: str, module: str, message: str) -> None:
     the calling thread. A warning is printed to stderr in that case.
     """
     required_level = {"INFO": 1, "WARNING": 2, "ERROR": 3, "CRITICAL": 3}.get(level)
-    if required_level is None or _log_level < required_level:
+    if required_level is None or required_level < _log_level:
         return
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     entry = (timestamp, module, level, message)
@@ -498,6 +499,61 @@ def log_critical(module: str, message: str, *args, exc_info: bool = False) -> No
     if exc_info:
         msg += _format_exc()
     _enqueue("CRITICAL", module, msg)
+
+
+# ---------------------------------------------------------------------------
+# Global error capture
+# ---------------------------------------------------------------------------
+
+def log_uncaught(module: str, message: str, exc_type, exc, tb, level: str = "ERROR") -> None:
+    """Log an exception that is not inside an except block (hooks, callbacks)."""
+    text = "".join(traceback.format_exception(exc_type, exc, tb)).replace("\r", "").replace("\n", " ").strip()
+    _lazy_init()
+    _enqueue(level, module, f"{_format_message(message, ())} | {text}")
+
+
+class _StdlibLoggingBridge(logging.Handler):
+    """Forward WARNING+ records from other libraries' stdlib loggers to the app log."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = record.getMessage()
+            if record.exc_info:
+                msg += " | " + "".join(traceback.format_exception(*record.exc_info)).replace("\r", "").replace("\n", " ").strip()
+            _enqueue("ERROR" if record.levelno >= logging.ERROR else "WARNING", record.name or "logging", msg)
+        except Exception:
+            pass
+
+
+def install_exception_logging() -> None:
+    """Send uncaught exceptions, thread exceptions and Python warnings to the app log."""
+    def _sys_hook(exc_type, exc, tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc, tb)
+            return
+        log_uncaught("Uncaught", "Unhandled exception in main thread.", exc_type, exc, tb, "CRITICAL")
+
+    def _thread_hook(args):
+        if args.exc_type is SystemExit:
+            return
+        name = getattr(args.thread, "name", "?")
+        log_uncaught("Thread", f"Unhandled exception in thread '{name}'.", args.exc_type, args.exc_value, args.exc_traceback)
+
+    def _unraisable_hook(u):
+        log_uncaught("Unraisable", f"Unraisable exception: {u.err_msg}", u.exc_type, u.exc_value, u.exc_traceback)
+
+    def _show_warning(message, category, filename, lineno, file=None, line=None):
+        log_warning("PythonWarnings", "%s:%s: %s: %s", filename, lineno, category.__name__, message)
+
+    sys.excepthook = _sys_hook
+    threading.excepthook = _thread_hook
+    sys.unraisablehook = _unraisable_hook
+    warnings.showwarning = _show_warning
+    bridge = _StdlibLoggingBridge(level=logging.WARNING)
+    root = logging.getLogger()
+    if not any(isinstance(h, _StdlibLoggingBridge) for h in root.handlers):
+        root.addHandler(bridge)
+    log_info(_SELF, "Global exception logging installed.")
 
 
 # ---------------------------------------------------------------------------
