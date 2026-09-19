@@ -1,10 +1,8 @@
 # Next ToDo's
 
-- Problems            
-    - When Checkbox with text "Active" named "Enable Keyboard Actions" in tab "Keyboard Actions" is pressed, it correctly removes the exclusive hook bound to the app of all function keys (F6 through F10). however, when clicked again to re-create the hooks, it re-creates just the hooks for F7 through F6. make it reset the F6 hook as well.
-    - Make sure that when this checkbox gets checked, all hooks are removed and completely new ones on a operating system level are re-created from scratch. Do the exact same when the button "Reset Key Bindings" is pressed. If this button is pressed, besides creating completely new handles for F6 through F10, check the "Enable Keyboard Actuions" checkbox if it is un-checked.
+- Problems                
     - F6 hotkey box is grayed out. Make it editable again.
-    - 
+
 - Bugs:
     
 - Non-Urgent Bugs
