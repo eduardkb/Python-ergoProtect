@@ -1,4 +1,4 @@
-APP_VERSION = "1.0.24"
+APP_VERSION = "1.0.25"
 """
 GraphicalInterface.py - Main Application Window for ErgoProtect
 ----------------------------------------------------------------
@@ -73,7 +73,7 @@ class GraphicalInterface:
       - Provide show() and hide() methods for the tray icon to call.
     """
 
-    def __init__(self, config_manager, icon_image=None, icon_path: str = None) -> None:
+    def __init__(self, config_manager, icon_image=None, icon_path: str = None, on_exit=None) -> None:
         """
         Build the window. Does NOT call mainloop() – that is the caller's
         responsibility (see main.py).
@@ -93,6 +93,7 @@ class GraphicalInterface:
         self._cfg = config_manager
         self._icon_image = icon_image  # PIL Image or None
         self._icon_path = icon_path    # str path to .ico or None
+        self._on_exit = on_exit
         self._root = tk.Tk()
         self._configure_window()
         self._build_tabs()
@@ -342,6 +343,10 @@ class GraphicalInterface:
             justify="left",
         ).grid(row=8, column=0, columnspan=3, sticky="w")
 
+        ttk.Button(frame, text="Exit", command=self.request_exit).grid(
+            row=9, column=2, sticky="e", pady=(20, 0)
+        )
+
         # Column weights
         frame.columnconfigure(1, weight=1)
 
@@ -415,6 +420,16 @@ class GraphicalInterface:
             self._root.destroy()
         except tk.TclError:
             pass  # already destroyed
+
+    def request_exit(self) -> None:
+        """Request the application-wide shutdown callback."""
+        if self._on_exit is not None:
+            try:
+                self._on_exit()
+                return
+            except Exception:
+                log_error(_MOD, "Application exit callback failed.", exc_info=True)
+        self.destroy()
 
     @property
     def root(self) -> tk.Tk:

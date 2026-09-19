@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.0.25] - 2026-09-19
+
+### Fixed
+- **Application Exit – Reliable close controls**: Fixed tray-menu exit handling and added an Exit button in General settings for immediate application close.
+
 ## [1.0.24] - 2026-09-19
 
 ### Improved

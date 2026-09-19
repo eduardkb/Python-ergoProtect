@@ -78,6 +78,8 @@ except ImportError:
 
 _LOCK_FILE_PATH: str = ""
 _LOCK_FILE_HANDLE = None  # kept open for the lifetime of the process
+_shutdown_lock = threading.Lock()
+_shutdown_started = False
 
 def _acquire_single_instance_lock() -> bool:
     """
@@ -228,7 +230,17 @@ def _shutdown(icon: "pystray.Icon", gui: GraphicalInterface) -> None: # type: ig
     Tkinter's mainloop() returns automatically once the root window is
     destroyed, which allows the Python process to exit naturally.
     """
+    global _shutdown_started
+    with _shutdown_lock:
+        if _shutdown_started:
+            return
+        _shutdown_started = True
+
     log_info("main", "Shutdown initiated by user.")
+
+    # Close the visible application immediately. Cleanup continues in this
+    # callback while the remaining worker threads are told to stop.
+    gui.destroy()
 
     # 1. Stop both keyboard services before logging shuts down.  This ensures
     # native F6-F10 hooks and their workers cannot outlive application cleanup.
@@ -241,13 +253,13 @@ def _shutdown(icon: "pystray.Icon", gui: GraphicalInterface) -> None: # type: ig
         service.stop()
 
     # 2. Stop the tray icon (stop() is blocking, so run in a thread)
-    threading.Thread(target=icon.stop, daemon=True).start()
+    if icon is not None:
+        threading.Thread(target=icon.stop, daemon=True).start()
 
     # 3. Flush log writer
     shutdown_logging()
 
-    # 4. Destroy the GUI (this causes mainloop() to return)
-    gui.destroy()
+    # The GUI was already destroyed above so the main loop can exit promptly.
 
 
 # ---------------------------------------------------------------------------
@@ -319,8 +331,14 @@ def main() -> None:
     # The window is created but immediately hidden so the app starts in the
     # tray without flashing a window at the user.
     # The icon_image is passed in so the GUI can display it in the title bar.
+    tray_icon = None
     try:
-        gui = GraphicalInterface(config_manager, icon_image=icon_image, icon_path=icon_path)
+        gui = GraphicalInterface(
+            config_manager,
+            icon_image=icon_image,
+            icon_path=icon_path,
+            on_exit=lambda: _shutdown(tray_icon, gui),
+        )
         gui.hide()
     except Exception as exc:
         log_error("main", "Failed to create GraphicalInterface: %s", exc, exc_info=True)

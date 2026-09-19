@@ -1,6 +1,26 @@
 # Next ToDo's
 - Problems    
     Noted:        
+        - when exiting through the tray icon exit option I get exeption below although the app exits. ( the exit button on the general tab works and does not display this error)
+            PS C:\Users\eduard\dev\Python-ergoProtect\src> python .\main.py
+            Exception in Tkinter callback
+            Traceback (most recent call last):
+            File "C:\Python314\Lib\tkinter\__init__.py", line 2093, in __call__
+                return self.func(*args)
+                    ~~~~~~~~~^^^^^^^
+            File "C:\Python314\Lib\tkinter\__init__.py", line 876, in callit
+                func(*args, **kw)
+                ~~~~^^^^^^^^^^^^^
+            File "C:\Users\eduard\dev\Python-ergoProtect\src\main.py", line 217, in <lambda>
+                gui.root.after(0, lambda: _shutdown(icon, gui))
+                                        ~~~~~~~~~^^^^^^^^^^^
+            File "C:\Users\eduard\dev\Python-ergoProtect\src\main.py", line 249, in _shutdown
+                keyboard_service.stop()
+                ~~~~~~~~~~~~~~~~~~~~~^^
+            File "C:\Users\eduard\dev\Python-ergoProtect\src\KeyboardActions.py", line 554, in stop
+                self._stop_drag_mouse_listener()
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+            AttributeError: 'KeyboardActionsService' object has no attribute '_stop_drag_mouse_listener'. Did you mean: '_drag_mouse_listener'?
         - "Keyboard Actinos" tab has all its options grayed out. un-do this. the options should be available and work for the user to change or disable the function if he needs/wants to.
 
 
