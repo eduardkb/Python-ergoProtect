@@ -47,8 +47,10 @@ def _default_app_dir() -> str:
     """
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
-    # Running from source: go up from src/ to project root.
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    module_dir = os.path.dirname(os.path.abspath(__file__))
+    # Source builds place this module in src/; the attached project keeps the
+    # modules at its root.  In both cases use the folder that runs the app.
+    return os.path.dirname(module_dir) if os.path.basename(module_dir).lower() == "src" else module_dir
 
 
 # Path to the config file, located next to the executable / project root.
@@ -68,8 +70,9 @@ _DEFAULTS: dict[str, dict[str, str]] = {
     #                                  long-running healthcare application.
     # ---------------------------------------------------------------------------
     "General": {
-        "logfilePath": _default_app_dir(),
+        "logfilePath": os.path.join(_default_app_dir(), "app_logs"),
         "DaysToKeepLog": "30",
+        "log_level": "1",
     },
     # ---------------------------------------------------------------------------
     # [autoClick] — AutoClick module settings

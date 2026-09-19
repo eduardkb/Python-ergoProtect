@@ -80,6 +80,7 @@ _SELF = "AppLogging"
 
 _log_dir: str = ""           # Directory where log files are written
 _days_to_keep: int = _DEFAULT_DAYS_TO_KEEP
+_log_level: int = 1
 _log_queue: queue.Queue = queue.Queue(maxsize=_QUEUE_MAX_SIZE)
 _writer_thread: Optional[threading.Thread] = None
 _stop_event: threading.Event = threading.Event()
@@ -115,9 +116,8 @@ def _default_log_dir() -> str:
     if getattr(sys, "frozen", False):
         base = os.path.dirname(sys.executable)
     else:
-        # Running from source: go up from src/ to project root.
-        src_dir = os.path.dirname(os.path.abspath(__file__))
-        base = os.path.dirname(src_dir)
+        module_dir = os.path.dirname(os.path.abspath(__file__))
+        base = os.path.dirname(module_dir) if os.path.basename(module_dir).lower() == "src" else module_dir
     log_dir = os.path.join(base, "app_logs")
     try:
         os.makedirs(log_dir, exist_ok=True)
@@ -236,7 +236,11 @@ def _writer_loop(log_dir: str) -> None:
 # Initialisation & cleanup
 # ---------------------------------------------------------------------------
 
-def init_logging(log_dir: Optional[str] = None, days_to_keep: int = _DEFAULT_DAYS_TO_KEEP) -> None:
+def init_logging(
+    log_dir: Optional[str] = None,
+    days_to_keep: int = _DEFAULT_DAYS_TO_KEEP,
+    log_level: int = 1,
+) -> None:
     """
     Initialise the logging system.
 
@@ -249,7 +253,7 @@ def init_logging(log_dir: Optional[str] = None, days_to_keep: int = _DEFAULT_DAY
         days_to_keep: Log files older than this many days are deleted.
                       Must be a positive integer. Default: 30.
     """
-    global _log_dir, _days_to_keep, _writer_thread, _initialized
+    global _log_dir, _days_to_keep, _log_level, _writer_thread, _initialized
 
     with _init_lock:
         if _initialized:
@@ -257,6 +261,7 @@ def init_logging(log_dir: Optional[str] = None, days_to_keep: int = _DEFAULT_DAY
 
         _log_dir = log_dir or _default_log_dir()
         _days_to_keep = max(1, days_to_keep)
+        _log_level = min(3, max(1, int(log_level)))
 
         try:
             os.makedirs(_log_dir, exist_ok=True)
@@ -274,7 +279,7 @@ def init_logging(log_dir: Optional[str] = None, days_to_keep: int = _DEFAULT_DAY
         _initialized = True
 
     # Log the startup event after the writer is running.
-    log_info(_SELF, "Logging initialised. Log dir: %s | Days to keep: %s", _log_dir, _days_to_keep)
+    log_info(_SELF, "Logging initialised. Log dir: %s | Days to keep: %s | Log level: %s", _log_dir, _days_to_keep, _log_level)
 
 
 def shutdown_logging() -> None:
@@ -349,6 +354,9 @@ def _enqueue(level: str, module: str, message: str) -> None:
     If the queue is full the entry is silently dropped to avoid blocking
     the calling thread. A warning is printed to stderr in that case.
     """
+    required_level = {"INFO": 1, "WARNING": 2, "ERROR": 3, "CRITICAL": 3}.get(level)
+    if required_level is None or _log_level < required_level:
+        return
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     entry = (timestamp, module, level, message)
     try:
@@ -517,6 +525,21 @@ def get_log_dir() -> str:
 def get_days_to_keep() -> int:
     """Return the current log retention period in days."""
     return _days_to_keep
+
+
+def get_log_level() -> int:
+    """Return the configured 1-3 log threshold."""
+    return _log_level
+
+
+def update_log_level(level: int) -> None:
+    """Apply a validated log threshold at runtime."""
+    global _log_level
+    new_level = min(3, max(1, int(level)))
+    if new_level == _log_level:
+        return
+    _log_level = new_level
+    log_info(_SELF, "Log level changed to %d.", new_level)
 
 
 def update_log_dir(new_dir: str) -> None:

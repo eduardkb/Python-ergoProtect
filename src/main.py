@@ -281,13 +281,17 @@ def main() -> None:
     # --- Logging initialisation -----------------------------------------
     # Read log settings from config.ini ([General] section).
     log_dir = config_manager.get_config("General", "logfilePath", None)
+    if log_dir:
+        log_dir = os.path.abspath(log_dir)
+        config_manager.set_config("General", "logfilePath", log_dir)
     days_to_keep = config_manager.get_int("General", "DaysToKeepLog", 30)
+    log_level = config_manager.get_int("General", "log_level", 1)
+    log_level = min(3, max(1, log_level))
+    config_manager.set_config("General", "log_level", str(log_level))
 
-    init_logging(log_dir=log_dir, days_to_keep=days_to_keep)
+    init_logging(log_dir=log_dir, days_to_keep=days_to_keep, log_level=log_level)
 
-    # If no log path was in config, persist the resolved default (app_logs
-    # subfolder next to the exe/project root) so the General tab shows the
-    # correct path and future runs reuse the same folder.
+    # Persist the resolved app_logs directory if the setting was absent.
     if not log_dir:
         resolved_log_dir = get_log_dir()
         config_manager.set_config("General", "logfilePath", resolved_log_dir)

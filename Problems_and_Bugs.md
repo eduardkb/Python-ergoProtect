@@ -1,6 +1,13 @@
 # Next ToDo's
 - Problems    
-    - on .exe file location, inside log folder, files older than 30 days are not being deleted
+    Noted:        
+        - "Keyboard Actinos" tab has all its options grayed out. un-do this. the options should be available and work for the user to change or disable the function if he needs/wants to.
+
+
+    Fixed:
+        - Tray icon of the application, if left clicked, a menu appears with one of the option being "exit". clicking it does not closes the app anymore. fix this. and, on the app's screen, "general" tab, add a "Exit" button on the bottom right of the tab. if clicked, the app should exit immediatelly.
+        - make a logging overhaul. the app reads parameters from a .ini file in the root directory where the app is located. make it read a parameter called log_level inside [GENERAL]. The default (if nothing present, is 1). 1 = only information. 2 = information + waring. 3 = all (info, warn, error). plus insert logging where needed and where appropriate if missing. Give a special attention to error logs writing them whenever anything happens that could indicate a problem with the app. As it is done already with other parameters, write this parameter as well to the .ini file on app startup if the parameter is not already there.
+        - make sure the log file location is always the same (read from the .ini file). if the .ini file "logfilepath" parameter inside [GENERAL] does not exist, write it as well as being "<Current location where python files or executable is being executed>/app_logs". The log files that are older than 30 days (parameter on .ini file) are not being deleted. make sure that on app launch, it consults the correct folder and then searches for old files inside this correct folder.
 
 - Bugs:
     

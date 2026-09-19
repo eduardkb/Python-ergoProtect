@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.0.24] - 2026-09-19
+
+### Improved
+- **Logging – Configurable log output**: Added a saved log-level setting, reliable default log-folder setup, and startup cleanup using the configured folder and retention period.
+
 ## [1.0.23] - 2026-09-18
 
 ### Improved
