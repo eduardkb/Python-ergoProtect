@@ -551,7 +551,7 @@ class KeyboardActionsService:
         self._release_drag_if_active("application stop")
         log_debug(_MOD, "  ✓ Drag released if active")
         
-        self._stop_drag_mouse_listener()
+        self._stop_drag_stop_listeners()
         log_debug(_MOD, "  ✓ Drag mouse listener stopped")
         
         self._power_watcher.stop()

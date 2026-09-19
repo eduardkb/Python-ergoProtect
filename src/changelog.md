@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.0.26] - 2026-09-19
+
+### Fixed
+- **Application Exit – Tray menu exception**: Fixed AttributeError when exiting through tray icon by calling the correct mouse listener cleanup method during shutdown.
+
 ## [1.0.25] - 2026-09-19
 
 ### Fixed

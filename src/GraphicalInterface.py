@@ -1,4 +1,4 @@
-APP_VERSION = "1.0.25"
+APP_VERSION = "1.0.26"
 """
 GraphicalInterface.py - Main Application Window for ErgoProtect
 ----------------------------------------------------------------
