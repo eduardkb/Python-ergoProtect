@@ -1,4 +1,4 @@
-APP_VERSION = "1.0.30"
+APP_VERSION = "1.0.31"
 """
 GraphicalInterface.py - Main Application Window for ErgoProtect
 ----------------------------------------------------------------
@@ -423,7 +423,7 @@ class GraphicalInterface:
         try:
             self._root.destroy()
         except tk.TclError:
-            pass  # already destroyed
+            log_warning(_MOD, "GUI window was already destroyed during shutdown.")
 
     def request_exit(self) -> None:
         """Request the application-wide shutdown callback."""

@@ -39,6 +39,19 @@ import threading
 from typing import Any
 
 
+def _log_config_error(message: str, exc: Exception) -> None:
+    """Send configuration failures to the application logger when available."""
+    try:
+        from src import AppLogging
+        if getattr(AppLogging, "_initialized", False):
+            AppLogging.log_error("ConfigManager", message, exc_info=True)
+            return
+    except Exception:
+        # Logging must never prevent configuration cleanup or shutdown.
+        pass
+    print(f"[ConfigManager] {message}: {exc}")
+
+
 def _default_app_dir() -> str:
     """
     Return the folder that contains the running executable (frozen) or the
@@ -177,7 +190,7 @@ class ConfigManager:
             try:
                 task()
             except Exception as exc:
-                print(f"[ConfigManager] Writer thread error: {exc}")
+                _log_config_error("Configuration writer task failed", exc)
             finally:
                 self._write_queue.task_done()
 
@@ -205,7 +218,7 @@ class ConfigManager:
                 with open(config_path, "w", encoding="utf-8") as f:
                     snapshot.write(f)
             except OSError as exc:
-                print(f"[ConfigManager] Warning: Could not save config — {exc}")
+                _log_config_error("Could not save configuration", exc)
 
         self._write_queue.put(_do_write)
 

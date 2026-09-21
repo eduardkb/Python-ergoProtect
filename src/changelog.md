@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.31] - 2026-09-21
+
+### Fixed
+- **Logging**: Existing `log_level` values are now read at startup without being overwritten; level filtering now correctly includes INFO, WARNING, and ERROR messages at level 3.
+- **Log retention**: Invalid retention values are normalized, and startup cleanup deletes eligible log files based on their actual age.
+- **Error reporting**: Added application error logging for configuration writes, startup/icon failures, listener cleanup, recovery paths, and keyboard-hook diagnostics.
+
 ## [1.0.30] - 2026-09-19
 
 ### Fixed

@@ -72,6 +72,15 @@ _CSV_HEADERS = ["timestamp", "module", "level", "message"]
 # Log file name suffix.
 _LOG_SUFFIX: str = "_appLog.csv"
 
+# Retention levels: higher settings include more messages. DEBUG remains
+# diagnostic-only and is not included in the user-selectable 1-3 levels.
+_LOG_LEVELS = {
+    "ERROR": 1,
+    "CRITICAL": 1,
+    "WARNING": 2,
+    "INFO": 3,
+}
+
 # Module identifier for internal log messages.
 _SELF = "AppLogging"
 
@@ -366,8 +375,8 @@ def _enqueue(level: str, module: str, message: str) -> None:
     If the queue is full the entry is silently dropped to avoid blocking
     the calling thread. A warning is printed to stderr in that case.
     """
-    required_level = {"INFO": 1, "WARNING": 2, "ERROR": 3, "CRITICAL": 3}.get(level)
-    if required_level is None or required_level < _log_level:
+    required_level = _LOG_LEVELS.get(level)
+    if required_level is None or required_level > _log_level:
         return
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     entry = (timestamp, module, level, message)

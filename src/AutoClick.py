@@ -412,7 +412,7 @@ class AutoClickService:
             try:
                 self._mouse_listener.stop()
             except Exception:
-                pass
+                log_error(_MOD, "Could not stop mouse listener.", exc_info=True)
             self._mouse_listener = None
 
     def _on_mouse_event(self, x, y, button, pressed) -> None:
@@ -671,7 +671,7 @@ class AutoClickService:
             if self._mouse:
                 self._mouse.release(Button.left)
         except Exception:
-            pass
+            log_error(_MOD, "Could not release the mouse button during recovery.", exc_info=True)
         self._active = self._cfg.get_bool("autoClick", "active", False)
         # Do NOT clear stop_event here — the watchdog will detect the dead
         # thread and perform a full restart including clearing stop_event.

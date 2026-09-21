@@ -205,7 +205,7 @@ class RestReminderService:
             try:
                 self._root.after(0, self._pause_win.force_close)
             except Exception:
-                pass
+                log_error(_MOD, "Could not schedule pause-screen shutdown.", exc_info=True)
 
     def is_running(self):
         """Return True if the monitor thread is alive and not stopping."""
@@ -290,7 +290,7 @@ class RestReminderService:
                 try:
                     lst.stop()
                 except Exception:
-                    pass
+                    log_error(_MOD, "Could not stop an activity listener.", exc_info=True)
         self._kb_listener    = None
         self._mouse_listener = None
 
@@ -615,14 +615,14 @@ class PauseScreen:
                 self._win._ergo_icon_ref = photo
                 self._win.wm_iconphoto(False, photo)
             except Exception:
-                pass
+                log_error(_MOD, "Could not apply the pause-screen icon image.", exc_info=True)
         elif self._icon_path:
             try:
                 import os
                 if os.path.exists(self._icon_path):
                     self._win.iconbitmap(self._icon_path)
             except Exception:
-                pass
+                log_error(_MOD, "Could not apply the pause-screen icon file.", exc_info=True)
 
         self._win.protocol("WM_DELETE_WINDOW", lambda: None)
         self._win.focus_force()
@@ -747,7 +747,7 @@ class PauseScreen:
         try:
             self._win.destroy()
         except Exception:
-            pass
+            log_error(_MOD, "Could not destroy the pause-screen window.", exc_info=True)
 
 
 # ===========================================================================

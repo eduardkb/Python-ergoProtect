@@ -110,7 +110,7 @@ def _acquire_single_instance_lock() -> bool:
             try:
                 _LOCK_FILE_HANDLE.close()
             except Exception:
-                pass
+                log_error("main", "Could not close the single-instance lock after acquisition failed.", exc_info=True)
             _LOCK_FILE_HANDLE = None
         return False
 
@@ -128,7 +128,7 @@ def _release_single_instance_lock() -> None:
                 fcntl.flock(_LOCK_FILE_HANDLE, fcntl.LOCK_UN)
             _LOCK_FILE_HANDLE.close()
         except Exception:
-            pass
+            log_error("main", "Could not release the single-instance lock.", exc_info=True)
         _LOCK_FILE_HANDLE = None
 
 
@@ -163,9 +163,9 @@ def _generate_and_save_icon(icon_path: str) -> "Image.Image":
     try:
         os.makedirs(os.path.dirname(icon_path), exist_ok=True)
         _make_icon(icon_path)
-        print(f"[main] Generated icon saved to {icon_path}")
+        log_info("main", "Generated icon saved to %s", icon_path)
     except Exception as exc:
-        print(f"[main] Could not save generated icon to {icon_path}: {exc}")
+        log_error("main", "Could not save generated icon to %s: %s", icon_path, exc, exc_info=True)
 
     return Image.open(icon_path).convert("RGBA")
 
@@ -188,7 +188,7 @@ def _load_or_generate_icon() -> "Image.Image":
             img = Image.open(icon_path).convert("RGBA")  # re-open after verify
             return img
         except Exception as exc:
-            print(f"[main] Could not open icon file: {exc} — regenerating.")
+            log_error("main", "Could not open icon file: %s; regenerating.", exc, exc_info=True)
 
     return _generate_and_save_icon(icon_path)
 
@@ -300,7 +300,6 @@ def main() -> None:
     days_to_keep = max(1, min(365, days_to_keep))
     log_level = config_manager.get_int("General", "log_level", 1)
     log_level = min(3, max(1, log_level))
-    config_manager.set_config("General", "log_level", str(log_level))
 
     init_logging(log_dir=log_dir, days_to_keep=days_to_keep, log_level=log_level)
     install_exception_logging()

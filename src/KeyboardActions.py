@@ -844,7 +844,7 @@ class KeyboardActionsService:
                     # Wait for heartbeat to update (callback should fire immediately)
                     test_fired.wait(timeout=0.5)
                 except Exception as e:
-                    pass  # Simulation may fail but we check heartbeat anyway
+                    log_error(_MOD, "Keyboard hook probe simulation failed: %s", e, exc_info=True)
                 
                 # Verify either the probe fired OR heartbeat was updated
                 heartbeat_after = self._last_heartbeat
@@ -859,7 +859,7 @@ class KeyboardActionsService:
                 try:
                     kb_lib.remove_hotkey(test_handler)
                 except Exception:
-                    pass
+                    log_error(_MOD, "Could not remove the temporary keyboard probe hotkey.", exc_info=True)
         
         except Exception as e:
             return False, f"Probe execution failed: {str(e)}"
