@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.0.32] - 2026-09-21
+
+### Fixed
+- **Logging**: Improved logging
+
 ## [1.0.31] - 2026-09-21
 
 ### Fixed

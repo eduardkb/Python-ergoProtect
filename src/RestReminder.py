@@ -1005,7 +1005,7 @@ def create_tab(parent, config_manager,
                         fg = _OVER_LIMIT_FG if general_secs > work_limit_secs else _DEFAULT_FG
                         general_lbl.configure(foreground=fg)
                     except Exception:
-                        pass
+                        log_error(_MOD, "Could not refresh the rest-reminder timer appearance.", exc_info=True)
 
                 # Mouse and keyboard: human-readable timestamps
                 mouse_var.set(_fmt_timestamp(snap["mouse_ts"]))

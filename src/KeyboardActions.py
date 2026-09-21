@@ -191,7 +191,7 @@ def _recreate_keyboard_listener() -> None:
             try:
                 old_listener.listening = False
             except Exception:
-                pass
+                log_error(_MOD, "Could not stop the previous keyboard listener.", exc_info=True)
             if listener_thread and listener_thread is not threading.current_thread():
                 listener_thread.join(timeout=1.0)
 
@@ -279,7 +279,7 @@ class _PowerEventWatcher:
                     ctypes.wintypes.HWND(self._hwnd), 0x0012, 0, 0
                 )
             except Exception:
-                pass
+                log_error(_MOD, "Could not post WM_QUIT to the power-event watcher.", exc_info=True)
         if self._thread:
             self._thread.join(timeout=3.0)
 
@@ -1253,14 +1253,14 @@ class KeyboardActionsService:
             try:
                 self._drag_mouse_listener.stop()
             except Exception:
-                pass
+                log_error(_MOD, "Could not stop the drag-stop mouse listener.", exc_info=True)
             self._drag_mouse_listener = None
 
         if self._drag_stop_key_hook_ref is not None:
             try:
                 kb_lib.unhook(self._drag_stop_key_hook_ref)
             except Exception:
-                pass
+                log_error(_MOD, "Could not remove the drag-stop keyboard hook.", exc_info=True)
             self._drag_stop_key_hook_ref = None
 
     def _stop_drag_stop_listeners_and_reverify(self) -> None:
@@ -1477,8 +1477,8 @@ def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
                     )
                 except Exception:
                     log_error(_MOD, "Failed to start service from toggle.", exc_info=True)
-        else:
-            log_info(_MOD, "Keyboard Actions disabled by user — stopping service.")
+        else:                       
+            log_error(_MOD, "_DEBUG_NOT_ACTUAL_ERROR: User initiated Disable Keyboard actions.")            
             if _service:
                 try:
                     _service.stop()

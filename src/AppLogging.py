@@ -72,13 +72,13 @@ _CSV_HEADERS = ["timestamp", "module", "level", "message"]
 # Log file name suffix.
 _LOG_SUFFIX: str = "_appLog.csv"
 
-# Retention levels: higher settings include more messages. DEBUG remains
-# diagnostic-only and is not included in the user-selectable 1-3 levels.
+# Logging levels: higher settings include more messages.
 _LOG_LEVELS = {
-    "ERROR": 1,
-    "CRITICAL": 1,
+    "INFO": 1,
     "WARNING": 2,
-    "INFO": 3,
+    "DEBUG": 3,
+    "ERROR": 3,
+    "CRITICAL": 3,
 }
 
 # Module identifier for internal log messages.
@@ -111,6 +111,16 @@ _console_logger.setLevel(logging.WARNING)
 _console_logger.propagate = False
 
 
+def _report_internal_error(message: str, exc: BaseException) -> None:
+    """Report a logger failure without enqueueing another potentially lost log."""
+    _console_logger.error(
+        "%s: %s",
+        message,
+        exc,
+        exc_info=(type(exc), exc, exc.__traceback__),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Path helpers
 # ---------------------------------------------------------------------------
@@ -131,8 +141,8 @@ def _default_log_dir() -> str:
     log_dir = os.path.join(base, "app_logs")
     try:
         os.makedirs(log_dir, exist_ok=True)
-    except OSError:
-        pass
+    except OSError as exc:
+        _report_internal_error(f"Could not create default log directory '{log_dir}'", exc)
     return log_dir
 
 
@@ -170,8 +180,8 @@ def _writer_loop(log_dir: str) -> None:
             try:
                 csv_file.flush()
                 csv_file.close()
-            except OSError:
-                pass
+            except OSError as exc:
+                _report_internal_error("Could not close the previous log file", exc)
 
         today = datetime.date.today()
         path = _today_log_path(log_dir)
@@ -185,8 +195,8 @@ def _writer_loop(log_dir: str) -> None:
                 csv_file.flush()
             current_date = today
         except OSError as exc:
-            # Non-fatal: silently fall back to console-only logging.
-            print(f"[AppLogging] Could not open log file '{path}': {exc}")
+            # Non-fatal: fall back to console-only logging, but report the failure.
+            _report_internal_error(f"Could not open log file '{path}'", exc)
             csv_file = None
             csv_writer = None
             current_date = today  # still update so we don't retry every loop
@@ -206,8 +216,8 @@ def _writer_loop(log_dir: str) -> None:
                 if csv_writer is not None:
                     try:
                         csv_writer.writerow(entry)
-                    except OSError:
-                        pass
+                    except Exception as exc:
+                        _report_internal_error("Could not write a log entry", exc)
                 _log_queue.task_done()
                 drained += 1
             except queue.Empty:
@@ -216,8 +226,8 @@ def _writer_loop(log_dir: str) -> None:
         if drained > 0 and csv_file is not None:
             try:
                 csv_file.flush()
-            except OSError:
-                pass
+            except OSError as exc:
+                _report_internal_error("Could not flush the log file", exc)
 
         _stop_event.wait(timeout=_WRITER_POLL_S)
 
@@ -228,8 +238,8 @@ def _writer_loop(log_dir: str) -> None:
             if csv_writer is not None:
                 try:
                     csv_writer.writerow(entry)
-                except OSError:
-                    pass
+                except Exception as exc:
+                    _report_internal_error("Could not write a final log entry", exc)
             _log_queue.task_done()
         except queue.Empty:
             break
@@ -238,8 +248,8 @@ def _writer_loop(log_dir: str) -> None:
         try:
             csv_file.flush()
             csv_file.close()
-        except OSError:
-            pass
+        except OSError as exc:
+            _report_internal_error("Could not flush or close the log file", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -276,7 +286,7 @@ def init_logging(
         try:
             os.makedirs(_log_dir, exist_ok=True)
         except OSError as exc:
-            print(f"[AppLogging] Could not create log directory '{_log_dir}': {exc}")
+            _report_internal_error(f"Could not create log directory '{_log_dir}'", exc)
 
         _stop_event.clear()
         _writer_thread = threading.Thread(
@@ -542,7 +552,7 @@ class _StdlibLoggingBridge(logging.Handler):
                 msg += " | " + "".join(traceback.format_exception(*record.exc_info)).replace("\r", "").replace("\n", " ").strip()
             _enqueue("ERROR" if record.levelno >= logging.ERROR else "WARNING", record.name or "logging", msg)
         except Exception:
-            pass
+            _report_internal_error("Could not forward a standard-library log record", sys.exc_info()[1])
 
 
 def install_exception_logging() -> None:

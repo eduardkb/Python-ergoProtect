@@ -137,12 +137,6 @@ from src.config_manager import ConfigManager
 from src.AppLogging import install_exception_logging, init_logging, cleanup_old_logs, log_info, log_error, shutdown_logging, get_log_dir
 from src.GraphicalInterface import GraphicalInterface
 
-from src import AutoClick
-from src import RestReminder
-from src import KeyboardActions
-from src import UsageGraphics
-from src import UsageLog
-
 # ---------------------------------------------------------------------------
 # Icon helpers
 # ---------------------------------------------------------------------------
@@ -303,6 +297,12 @@ def main() -> None:
 
     init_logging(log_dir=log_dir, days_to_keep=days_to_keep, log_level=log_level)
     install_exception_logging()
+
+    # Import feature modules only after logging has been initialized from
+    # config.ini. Some modules log during import, and importing them earlier
+    # would trigger lazy default logging before the configured level is read.
+    global AutoClick, KeyboardActions
+    from src import AutoClick, KeyboardActions
 
     # Persist the resolved app_logs directory if the setting was absent.
     if not log_dir:

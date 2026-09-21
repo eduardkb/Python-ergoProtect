@@ -744,6 +744,8 @@ def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
                     _ka_mod.reset_function_key_bindings(include_keyboard_actions=True)
                 except Exception:
                     log_error(_MOD, "Shared function-key reset failed from AutoClick toggle.", exc_info=True)
+        else:
+            log_warning(_MOD, "User initiated Disable Auto-click action")
 
     ttk.Label(frame, text="Enable AutoClick:").grid(row=1, column=0, sticky="w", pady=6)
     ttk.Checkbutton(
