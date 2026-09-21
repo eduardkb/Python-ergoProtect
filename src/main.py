@@ -301,8 +301,8 @@ def main() -> None:
     # Import feature modules only after logging has been initialized from
     # config.ini. Some modules log during import, and importing them earlier
     # would trigger lazy default logging before the configured level is read.
-    global AutoClick, KeyboardActions
-    from src import AutoClick, KeyboardActions
+    global AutoClick, KeyboardActions, RestReminder, UsageGraphics, UsageLog
+    from src import AutoClick, KeyboardActions, RestReminder, UsageGraphics, UsageLog
 
     # Persist the resolved app_logs directory if the setting was absent.
     if not log_dir:
