@@ -297,6 +297,7 @@ def main() -> None:
         log_dir = os.path.abspath(log_dir)
         config_manager.set_config("General", "logfilePath", log_dir)
     days_to_keep = config_manager.get_int("General", "DaysToKeepLog", 30)
+    days_to_keep = max(1, min(365, days_to_keep))
     log_level = config_manager.get_int("General", "log_level", 1)
     log_level = min(3, max(1, log_level))
     config_manager.set_config("General", "log_level", str(log_level))

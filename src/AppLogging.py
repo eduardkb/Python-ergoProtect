@@ -309,6 +309,10 @@ def cleanup_old_logs(log_dir: Optional[str] = None, days_to_keep: Optional[int] 
     """
     target_dir = log_dir or _log_dir or _default_log_dir()
     retention = days_to_keep if days_to_keep is not None else _days_to_keep
+    try:
+        retention = max(1, int(retention))
+    except (TypeError, ValueError):
+        retention = _DEFAULT_DAYS_TO_KEEP
     cutoff = datetime.date.today() - datetime.timedelta(days=retention)
 
     if not os.path.isdir(target_dir):
@@ -327,8 +331,15 @@ def cleanup_old_logs(log_dir: Optional[str] = None, days_to_keep: Optional[int] 
         except ValueError:
             continue  # Not a date-named file — skip it.
 
-        if file_date < cutoff:
-            full_path = os.path.join(target_dir, filename)
+        full_path = os.path.join(target_dir, filename)
+        try:
+            modified_date = datetime.date.fromtimestamp(os.path.getmtime(full_path))
+        except OSError as exc:
+            errors += 1
+            log_error(_SELF, "Could not inspect log file '%s': %s", filename, exc)
+            continue
+
+        if modified_date < cutoff:
             try:
                 os.remove(full_path)
                 deleted += 1
