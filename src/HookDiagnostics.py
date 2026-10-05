@@ -98,7 +98,7 @@ class HookLossDetector:
                     pass
             return sorted(processes, key=lambda x: x[1])
         except Exception as e:
-            log_warning(_MOD, "Could not capture process snapshot: %s", str(e))
+            log_error(_MOD, "Could not capture process snapshot: %s", str(e), exc_info=True)
             return []
     
     def _log_processes_at_loss(self):

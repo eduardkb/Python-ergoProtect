@@ -34,6 +34,7 @@ Graceful shutdown process
 
 import sys
 import os
+import errno
 import threading
 import tkinter as tk
 import tkinter.messagebox as _msgbox
@@ -81,13 +82,13 @@ _LOCK_FILE_HANDLE = None  # kept open for the lifetime of the process
 _shutdown_lock = threading.Lock()
 _shutdown_started = False
 
-def _acquire_single_instance_lock() -> bool:
+def _acquire_single_instance_lock() -> bool | None:
     """
     Attempt to acquire an exclusive file lock to ensure only one instance of
     ErgoProtect can run at a time.
 
     On Windows we use msvcrt.locking(); on POSIX we use fcntl.flock().
-    Returns True if the lock was acquired (first instance), False otherwise.
+    Returns True if acquired, False on lock contention, or None on failure.
     """
     global _LOCK_FILE_PATH, _LOCK_FILE_HANDLE
 
@@ -96,6 +97,11 @@ def _acquire_single_instance_lock() -> bool:
 
     try:
         _LOCK_FILE_HANDLE = open(_LOCK_FILE_PATH, "w")
+    except OSError:
+        log_error("main", "Could not open the single-instance lock file '%s'.", _LOCK_FILE_PATH, exc_info=True)
+        return None
+
+    try:
         if sys.platform == "win32":
             import msvcrt
             msvcrt.locking(_LOCK_FILE_HANDLE.fileno(), msvcrt.LK_NBLCK, 1)
@@ -105,14 +111,21 @@ def _acquire_single_instance_lock() -> bool:
         _LOCK_FILE_HANDLE.write(str(os.getpid()))
         _LOCK_FILE_HANDLE.flush()
         return True
-    except (IOError, OSError):
+    except Exception as exc:
+        is_contention = isinstance(exc, OSError) and (
+            (sys.platform == "win32" and getattr(exc, "winerror", None) == 33)
+            or (sys.platform != "win32" and exc.errno in (errno.EACCES, errno.EAGAIN))
+        )
         if _LOCK_FILE_HANDLE:
             try:
                 _LOCK_FILE_HANDLE.close()
             except Exception:
                 log_error("main", "Could not close the single-instance lock after acquisition failed.", exc_info=True)
             _LOCK_FILE_HANDLE = None
-        return False
+        if is_contention:
+            return False
+        log_error("main", "Could not acquire the single-instance lock at '%s'.", _LOCK_FILE_PATH, exc_info=True)
+        return None
 
 
 def _release_single_instance_lock() -> None:
@@ -269,7 +282,8 @@ def main() -> None:
     """
     # --- Single-instance guard ------------------------------------------
     # Prevent two copies of ErgoProtect from running simultaneously.
-    if not _acquire_single_instance_lock():
+    lock_acquired = _acquire_single_instance_lock()
+    if lock_acquired is False:
         # Show a brief message then exit immediately.
         _tmp_root = tk.Tk()
         _tmp_root.withdraw()
@@ -280,6 +294,12 @@ def main() -> None:
         )
         _tmp_root.destroy()
         sys.exit(0)
+    if lock_acquired is None:
+        _msgbox.showerror(
+            "ErgoProtect Startup Error",
+            "ErgoProtect could not acquire its single-instance lock. Check the application log for details.",
+        )
+        sys.exit(1)
 
     # --- Config ---------------------------------------------------------
     config_manager = ConfigManager()

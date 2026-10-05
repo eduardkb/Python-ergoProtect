@@ -1,4 +1,4 @@
-APP_VERSION = "1.0.32"
+APP_VERSION = "1.0.33"
 """
 GraphicalInterface.py - Main Application Window for ErgoProtect
 ----------------------------------------------------------------
@@ -59,6 +59,7 @@ _TABS = [
     ("Usage Graphics",    "UsageGraphics"),    
     ("Help",              "Help"),
 ]
+_OPTIONAL_TABS = {"Help"}
 
 
 class GraphicalInterface:
@@ -278,7 +279,7 @@ class GraphicalInterface:
                     "Invalid Path",
                     f"Cannot create or access the folder:\n{new_path}\n\n{exc}",
                 )
-                log_warning(_MOD, "Invalid log path entered: %s — %s", new_path, exc)
+                log_error(_MOD, "Invalid log path entered: %s — %s", new_path, exc, exc_info=True)
                 return
 
             # Persist to config and update the runtime logger
@@ -377,10 +378,11 @@ class GraphicalInterface:
         haven't been written yet, or optional dependencies missing).
         """
         # Strategy 1: src.<module_name> (normal Python execution)
+        src_error = None
         try:
             return importlib.import_module(f"src.{module_name}")
-        except ImportError:
-            pass
+        except ImportError as exc:
+            src_error = exc
         except Exception as exc:
             log_error(_MOD, "Unexpected error importing src.%s: %s", module_name, exc, exc_info=True)
             return None
@@ -388,10 +390,33 @@ class GraphicalInterface:
         # Strategy 2: <module_name> directly (PyInstaller bundle / flat layout)
         try:
             return importlib.import_module(module_name)
-        except ImportError:
+        except ImportError as flat_error:
+            expected_missing_names = {f"src.{module_name}", module_name, "src"}
+            optional_module_absent = (
+                module_name in _OPTIONAL_TABS
+                and getattr(src_error, "name", None) in expected_missing_names
+                and getattr(flat_error, "name", None) == module_name
+            )
+            if optional_module_absent:
+                log_debug(_MOD, "Optional tab module %s is not installed.", module_name)
+                return None
+            log_error(
+                _MOD,
+                "Could not load feature module %s; src import failed with %r, flat import failed with %r.",
+                module_name,
+                src_error,
+                flat_error,
+            )
             return None
         except Exception as exc:
-            log_error(_MOD, "Unexpected error importing %s: %s", module_name, exc, exc_info=True)
+            log_error(
+                _MOD,
+                "Unexpected error importing %s after src import failed with %r: %s",
+                module_name,
+                src_error,
+                exc,
+                exc_info=True,
+            )
             return None
 
     @staticmethod

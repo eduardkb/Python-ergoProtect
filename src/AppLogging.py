@@ -77,8 +77,8 @@ _LOG_LEVELS = {
     "INFO": 1,
     "WARNING": 2,
     "DEBUG": 3,
-    "ERROR": 3,
-    "CRITICAL": 3,
+    "ERROR": 1,
+    "CRITICAL": 1,
 }
 
 # Module identifier for internal log messages.
@@ -355,7 +355,7 @@ def cleanup_old_logs(log_dir: Optional[str] = None, days_to_keep: Optional[int] 
             modified_date = datetime.date.fromtimestamp(os.path.getmtime(full_path))
         except OSError as exc:
             errors += 1
-            log_error(_SELF, "Could not inspect log file '%s': %s", filename, exc)
+            log_error(_SELF, "Could not inspect log file '%s': %s", filename, exc, exc_info=True)
             continue
 
         if modified_date < cutoff:
@@ -365,7 +365,7 @@ def cleanup_old_logs(log_dir: Optional[str] = None, days_to_keep: Optional[int] 
                 log_debug(_SELF, "Deleted old log file: %s", filename)
             except OSError as exc:
                 errors += 1
-                log_error(_SELF, "Could not delete log file '%s': %s", filename, exc)
+                log_error(_SELF, "Could not delete log file '%s': %s", filename, exc, exc_info=True)
 
     log_info(
         _SELF,
@@ -409,7 +409,8 @@ def _format_message(message: str, args: tuple) -> str:
     if args:
         try:
             return message % args
-        except (TypeError, ValueError):
+        except (TypeError, ValueError) as exc:
+            _report_internal_error("Could not format an application log message", exc)
             return f"{message} {args}"
     return message
 

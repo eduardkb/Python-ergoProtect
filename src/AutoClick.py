@@ -556,10 +556,15 @@ class AutoClickService:
 
                 try:
                     pos = self._mouse.position
-                except Exception:
+                except Exception as exc:
                     # pynput mouse controller can fail after hibernation; exit
                     # so the watchdog detects a dead thread and restarts cleanly.
-                    log_warning(_MOD, "Mouse position read failed — exiting monitor loop for watchdog restart.")
+                    log_error(
+                        _MOD,
+                        "Mouse position read failed — exiting monitor loop for watchdog restart: %s",
+                        exc,
+                        exc_info=True,
+                    )
                     return
 
                 if pos is None:

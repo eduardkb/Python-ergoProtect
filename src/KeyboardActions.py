@@ -70,18 +70,26 @@ except ImportError:
 
 # Windows power-event support (optional — gracefully absent on non-Windows).
 _WIN32_AVAILABLE = False
+_WIN32_IMPORT_ERROR = None
 if sys.platform == "win32":
     try:
         import ctypes
         import ctypes.wintypes
         _WIN32_AVAILABLE = True
-    except Exception:
-        pass
+    except Exception as exc:
+        _WIN32_IMPORT_ERROR = exc
 
 try:
     from src.AppLogging import log_info, log_warning, log_error, log_debug
 except ImportError:
     from AppLogging import log_info, log_warning, log_error, log_debug
+
+if _WIN32_IMPORT_ERROR is not None:
+    log_error(
+        "KeyboardActions",
+        "Could not import ctypes for Windows power-event support: %r",
+        _WIN32_IMPORT_ERROR,
+    )
 
 try:
     from src.HookDiagnostics import (
@@ -747,7 +755,12 @@ class KeyboardActionsService:
                 # listener thread or missing registered handlers.  Do not treat
                 # an injected test key as a failed physical-key binding.
                 restart_reason = None
-                if not hook_alive:
+                if hook_alive is None:
+                    restart_reason = (
+                        "KEYBOARD LISTENER HEALTH CHECK INDETERMINATE — "
+                        "Listener state could not be inspected; attempting recovery."
+                    )
+                elif hook_alive is False:
                     heartbeat_age = time.monotonic() - self._last_heartbeat
                     restart_reason = (
                         f"OS KEYBOARD LISTENER DEAD — Internal listener thread is no longer running. "
@@ -864,10 +877,10 @@ class KeyboardActionsService:
         except Exception as e:
             return False, f"Probe execution failed: {str(e)}"
 
-    def _is_keyboard_hook_alive(self) -> bool:
+    def _is_keyboard_hook_alive(self) -> bool | None:
         """
         Return True if the ``keyboard`` library's internal listener thread
-        appears to be running, False otherwise.
+        appears to be running, False if dead, or None if inspection failed.
 
         Inspects ``keyboard._listener`` (a private attribute). If the attribute
         does not exist the library version does not expose it; in that case we
@@ -890,8 +903,8 @@ class KeyboardActionsService:
                 return False
             return True
         except Exception:
-            # Any introspection error → assume alive to avoid restart storms.
-            return True
+            log_error(_MOD, "Could not inspect keyboard-hook liveness.", exc_info=True)
+            return None
 
     def _on_system_resume(self) -> None:
         """

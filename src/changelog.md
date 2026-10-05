@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.0.33] - 2026-10-02
+
+### Fixed
+- **Logging**: ERROR and CRITICAL records are retained at every verbosity level; formatting and log-cleanup failures now include diagnostic details.
+- **Keyboard Actions**: Windows power-watcher import failures are logged, and hook-liveness inspection failures are reported and trigger deliberate watchdog recovery.
+- **Feature loading and startup**: Feature import causes are preserved, optional Help absence is handled quietly, and single-instance lock contention is distinguished from acquisition errors.
+- **Operational diagnostics**: Mouse-position, process-snapshot, and log-directory failures are recorded as errors with traceback details where available.
+
 ## [1.0.32] - 2026-09-21
 
 ### Fixed
