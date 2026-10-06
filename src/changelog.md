@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.0.34] - 2026-10-06
+
+### Fixed
+- **Function keys**: Improved detection and recovery when F6-F10 stop responding, and made Reset Key Bindings verify that the keys are re-bound successfully.
+
 ## [1.0.33] - 2026-10-02
 
 ### Fixed

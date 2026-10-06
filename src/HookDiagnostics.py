@@ -245,6 +245,7 @@ class HotkeyRegistrationLogger:
     def __init__(self):
         self._lock = threading.Lock()
         self._registered_hotkeys: dict = {}
+        self._last_dispatch: dict = {}
         self._register_count = 0
         self._unregister_count = 0
         
@@ -255,6 +256,7 @@ class HotkeyRegistrationLogger:
                 'action': action,
                 'time': time.monotonic()
             }
+            self._last_dispatch.pop(key, None)
             self._register_count += 1
         
         log_debug(
@@ -268,6 +270,7 @@ class HotkeyRegistrationLogger:
         with self._lock:
             if key in self._registered_hotkeys:
                 del self._registered_hotkeys[key]
+            self._last_dispatch.pop(key, None)
             self._unregister_count += 1
         
         log_debug(
@@ -279,7 +282,10 @@ class HotkeyRegistrationLogger:
     def all_unregistered(self, count: int):
         """Log mass unregistration (e.g., unhook_all)."""
         with self._lock:
-            self._registered_hotkeys.clear()
+            for key in tuple(self._registered_hotkeys):
+                if key.upper() != "F6":
+                    del self._registered_hotkeys[key]
+                    self._last_dispatch.pop(key, None)
             self._unregister_count += count
         
         log_info(
@@ -292,6 +298,17 @@ class HotkeyRegistrationLogger:
         """Return list of currently registered hotkeys."""
         with self._lock:
             return list(self._registered_hotkeys.keys())
+
+    def hotkey_dispatched(self, key: str) -> None:
+        """Record that ErgoProtect handled a key event."""
+        with self._lock:
+            if key in self._registered_hotkeys:
+                self._last_dispatch[key] = time.monotonic()
+
+    def get_last_dispatch(self, key: str) -> Optional[float]:
+        """Return the last app callback time for a registered key."""
+        with self._lock:
+            return self._last_dispatch.get(key)
     
     def get_statistics(self) -> dict:
         """Return hotkey registration statistics."""

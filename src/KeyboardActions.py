@@ -124,6 +124,9 @@ def _install_native_hook_capture() -> None:
         import keyboard._winkeyboard as win_keyboard
 
         original_set_hook = win_keyboard.SetWindowsHookEx
+        if getattr(original_set_hook, "_ergoprotect_capture_wrapper", False):
+            _native_hook_capture_installed = True
+            return
 
         def _recording_set_hook(*args):
             handle = original_set_hook(*args)
@@ -134,6 +137,8 @@ def _install_native_hook_capture() -> None:
             else:
                 log_error(_MOD, "Native SetWindowsHookExW failed to create a keyboard hook.")
             return handle
+
+        _recording_set_hook._ergoprotect_capture_wrapper = True
 
         win_keyboard.SetWindowsHookEx = _recording_set_hook
 
@@ -472,6 +477,7 @@ class KeyboardActionsService:
         self._hotkey_handlers: list = []
         self._heartbeat_hook_ref = None
         self._check_count = 0  # Watchdog cycle counter for logging
+        self._delivery_monitor_thread: threading.Thread | None = None
 
         # pynput mouse listener that intercepts any mouse press during an active
         # drag-drop to release the held button and restore hook state cleanly.
@@ -500,7 +506,96 @@ class KeyboardActionsService:
 
     def _enqueue_hook_action(self, action, generation: int, key: str) -> None:
         """Minimal low-level-hook callback: queue work without logging or I/O."""
+        hotkey_logger.hotkey_dispatched(key)
         self._hook_action_queue.put_nowait((action, generation, key))
+
+    def _function_key_delivery_loop(self) -> None:
+        """Detect physical F6-F10 presses that did not reach an app callback."""
+        if not _WIN32_AVAILABLE:
+            return
+
+        previous: dict[str, bool] = {}
+        pending: dict[str, tuple[float, float, float | None]] = {}
+        last_dispatch_seen: dict[str, float | None] = {}
+        reported: set[str] = set()
+        while True:
+            now = time.monotonic()
+            try:
+                self._check_function_key_delivery(
+                    now, previous, pending, last_dispatch_seen, reported
+                )
+            except Exception:
+                log_error(_MOD, "Function-key delivery monitor failed.", exc_info=True)
+            time.sleep(0.01)
+
+    def _check_function_key_delivery(
+        self,
+        now: float,
+        previous: dict[str, bool],
+        pending: dict[str, tuple[float, float, float | None]],
+        last_dispatch_seen: dict[str, float | None],
+        reported: set[str],
+    ) -> None:
+        """Compare Windows key state with the application's registered callbacks."""
+        active_keys = {key.upper() for key in hotkey_logger.get_active_hotkeys()}
+        virtual_keys = {"F6": 0x75, "F7": 0x76, "F8": 0x77, "F9": 0x78, "F10": 0x79}
+        for key, virtual_key in virtual_keys.items():
+            key_state = ctypes.windll.user32.GetAsyncKeyState(virtual_key)
+            down = bool(key_state & 0x8000)
+            pressed_since_check = bool(key_state & 0x0001)
+            dispatched_at = hotkey_logger.get_last_dispatch(key)
+            new_press = (down and not previous.get(key, False)) or pressed_since_check
+
+            if new_press and key in active_keys:
+                pending[key] = (now, now + 0.2, last_dispatch_seen.get(key))
+
+            if not down:
+                previous[key] = False
+                reported.discard(key)
+            else:
+                previous[key] = True
+
+            attempt = pending.get(key)
+            if attempt and now >= attempt[1]:
+                _detected_at, _deadline, dispatch_before_press = attempt
+                pending.pop(key, None)
+                if dispatched_at is not None and (
+                    dispatch_before_press is None or dispatched_at > dispatch_before_press
+                ):
+                    continue
+                if key in reported:
+                    continue
+
+                reported.add(key)
+                log_error(
+                    _MOD,
+                    "Windows observed %s key-down, but ErgoProtect's registered callback did not run; "
+                    "the key may have reached the foreground application. Forcing native hook rebuild.",
+                    key,
+                )
+                include_actions = bool(
+                    _service is not None
+                    and _service._thread is not None
+                    and _service._thread.is_alive()
+                    and not _service._stop_event.is_set()
+                )
+                threading.Thread(
+                    target=self._recover_missing_function_key,
+                    args=(include_actions, key),
+                    name="FunctionKeyDeliveryRecovery",
+                    daemon=True,
+                ).start()
+            last_dispatch_seen[key] = dispatched_at
+
+    @staticmethod
+    def _recover_missing_function_key(include_actions: bool, key: str) -> None:
+        try:
+            reset_function_key_bindings(
+                include_keyboard_actions=include_actions,
+                reason=f"Windows observed {key} without ErgoProtect callback",
+            )
+        except Exception:
+            log_error(_MOD, "Forced function-key recovery failed after missing %s callback.", key, exc_info=True)
 
     def _hook_action_loop(self) -> None:
         """Run mouse actions and their logging away from the Windows hook."""
@@ -553,6 +648,14 @@ class KeyboardActionsService:
         )
         self._thread.start()
         log_debug(_MOD, "  ✓ Service thread started")
+
+        if self._delivery_monitor_thread is None or not self._delivery_monitor_thread.is_alive():
+            self._delivery_monitor_thread = threading.Thread(
+                target=self._function_key_delivery_loop,
+                name="FunctionKeyDeliveryMonitor",
+                daemon=True,
+            )
+            self._delivery_monitor_thread.start()
 
         log_debug(_MOD, "  Starting watchdog thread...")
         self._watchdog_thread = threading.Thread(
@@ -665,6 +768,10 @@ class KeyboardActionsService:
                     raise RuntimeError(
                         "Fresh native hook did not register every F7-F10 handler and heartbeat."
                     )
+                if _WIN32_AVAILABLE:
+                    with _native_hook_lock:
+                        if not _native_hook_handles:
+                            raise RuntimeError("Fresh native keyboard hook handle was not captured.")
                 log_info(_MOD, "  ✓ Hotkeys re-registered")
             
             self._mapping_lost = False
@@ -1006,7 +1113,7 @@ class KeyboardActionsService:
                     ),
                     suppress=True,
                 )
-                self._hotkey_handlers.append(handler)
+                self._hotkey_handlers.append((key, handler))
                 hotkey_logger.hotkey_registered(key, callback.__name__)
                 log_info(_MOD, "  ✓ Hotkey registered: %s → %s()", key, callback.__name__)
                 registered_count += 1
@@ -1023,7 +1130,7 @@ class KeyboardActionsService:
         except Exception as e:
             log_error(_MOD, "  ❌ FAILED to register heartbeat hook: %s", str(e), exc_info=True)
 
-        self._hotkeys_registered = True
+        self._hotkeys_registered = registered_count > 0 or self._heartbeat_hook_ref is not None
         self._actions_enabled = registered_count == len(keys)
         log_info(
             _MOD,
@@ -1056,18 +1163,17 @@ class KeyboardActionsService:
         
         # Remove each action hotkey individually.
         removed_count = 0
-        for i, handler in enumerate(self._hotkey_handlers):
+        for i, (key, handler) in enumerate(self._hotkey_handlers):
             try:
                 log_debug(_MOD, "  Removing action hotkey #%d...", i + 1)
                 kb_lib.remove_hotkey(handler)
+                hotkey_logger.hotkey_unregistered(key)
                 log_debug(_MOD, "  ✓ Action hotkey #%d removed", i + 1)
                 removed_count += 1
             except Exception as e:
                 log_warning(_MOD, "  ⚠️  Action hotkey #%d already removed or failed: %s", i + 1, str(e))
         
         self._hotkey_handlers.clear()
-        hotkey_logger.all_unregistered(removed_count)
-
         # Remove the heartbeat on_press hook.
         if self._heartbeat_hook_ref is not None:
             try:
@@ -1392,20 +1498,30 @@ def reset_function_key_bindings(
             include_keyboard_actions = False
         try:
             # F6 is removed before the native hook is torn down.
-            if auto_click_service is not None:
-                auto_click_service._unregister_hotkey()
+            if auto_click_service is None:
+                raise RuntimeError("AutoClick service is unavailable; F6 cannot be rebound.")
+            auto_click_service._unregister_hotkey()
             if include_keyboard_actions:
                 if _service is None:
-                    log_warning(_MOD, "F7-F10 reset requested but KeyboardActions service is unavailable.")
+                    _recreate_keyboard_listener()
+                    raise RuntimeError("F7-F10 reset requested but KeyboardActions service is unavailable.")
                 else:
                     _service._rebuild_keyboard_actions_native()
                     log_info(_MOD, "F7-F10 were registered on the fresh native hook.")
+            else:
+                _recreate_keyboard_listener()
+                log_info(_MOD, "Native hook recreated for the active F6 binding; F7-F10 remain disabled.")
         finally:
             # F6 is always re-created on the fresh hook, even if F7-F10 failed.
             if auto_click_service is not None:
                 auto_click_service._register_hotkey()
                 if auto_click_service._hotkey_handler is None:
                     log_error(_MOD, "F6 AutoClick hotkey could not be re-registered after reset.")
+                    raise RuntimeError("F6 AutoClick hotkey could not be re-registered after reset.")
+        if _WIN32_AVAILABLE:
+            with _native_hook_lock:
+                if not _native_hook_handles:
+                    raise RuntimeError("Reset finished without a live native keyboard hook handle.")
         log_info(_MOD, "Serialized F6-F10 native reset complete.")
 
 
@@ -1642,6 +1758,7 @@ def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
         key — so it is always safe to reset.
         """
         log_info(_MOD, "Reset Key Bindings clicked — releasing and re-binding function key hooks.")
+        reset_succeeded = False
         try:
             if not enabled_var.get():
                 # Also turns the feature back on (config, service, full F6-F10 reset).
@@ -1649,13 +1766,25 @@ def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
                 _on_toggle()
             else:
                 reset_function_key_bindings(include_keyboard_actions=True, reason="Reset Key Bindings button")
+            auto_click_service = _get_autoclick_service()
+            reset_succeeded = bool(
+                _service is not None
+                and _service._thread is not None
+                and _service._thread.is_alive()
+                and len(_service._hotkey_handlers) == 4
+                and _service._heartbeat_hook_ref is not None
+                and auto_click_service is not None
+                and auto_click_service._hotkey_handler is not None
+                and (not _WIN32_AVAILABLE or bool(_native_hook_handles))
+            )
         except Exception:
             log_error(_MOD, "Failed to reset function-key bindings.", exc_info=True)
 
         if _DEPS_AVAILABLE:
             status_label.config(
-                text="Key bindings reset. Hotkeys re-bound to ErgoProtect.",
-                foreground="#228822",
+                text=("Key bindings reset and verified." if reset_succeeded else
+                      "Key binding reset failed. See application log."),
+                foreground=("#228822" if reset_succeeded else "#cc4444"),
             )
 
     ttk.Button(

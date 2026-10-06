@@ -142,6 +142,7 @@ class AutoClickService:
 
     def _enqueue_hook_action(self, generation: int) -> None:
         """Minimal F6 hook callback: schedule work without logging or I/O."""
+        hotkey_logger.hotkey_dispatched(self._hotkey_key or "F6")
         self._hook_action_queue.put_nowait(generation)
 
     def _hook_action_loop(self) -> None:
@@ -314,11 +315,10 @@ class AutoClickService:
                 log_debug(_MOD, "_unregister_hotkey() guard check - already unregistered by another thread")
                 return  # already unregistered by another thread while we waited.
             
+            key_name = self._hotkey_key or "F6"
             try:
-                key_name = self._hotkey_key or "F6"
                 log_info(_MOD, ">>> Unregistering F6 AutoClick hotkey: %s", key_name)
                 kb_lib.remove_hotkey(self._hotkey_handler)
-                hotkey_logger.hotkey_unregistered(key_name)
                 log_info(_MOD, "✓ F6 AutoClick hotkey '%s' unregistered successfully", key_name)
             except Exception as e:
                 # Handler may already be gone (e.g. after hibernation hook reset).
@@ -330,6 +330,7 @@ class AutoClickService:
                     str(e)
                 )
             finally:
+                hotkey_logger.hotkey_unregistered(key_name)
                 self._hotkey_handler = None
                 self._hotkey_key = ""
 
@@ -500,10 +501,10 @@ class AutoClickService:
             return
 
         try:
-            import KeyboardActions as _ka
+            from src import KeyboardActions as _ka
         except ImportError:
             try:
-                from src import KeyboardActions as _ka
+                import KeyboardActions as _ka
             except ImportError:
                 _ka = None
 
