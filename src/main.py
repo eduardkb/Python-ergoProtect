@@ -244,6 +244,7 @@ def _shutdown(icon: "pystray.Icon", gui: GraphicalInterface) -> None: # type: ig
         _shutdown_started = True
 
     log_info("main", "Shutdown initiated by user.")
+    log_info("main", "Shutdown-Application Closed / Stopped / Exited")
 
     # Close the visible application immediately. Cleanup continues in this
     # callback while the remaining worker threads are told to stop.

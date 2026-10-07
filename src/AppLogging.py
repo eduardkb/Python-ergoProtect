@@ -298,7 +298,9 @@ def init_logging(
         _writer_thread.start()
         _initialized = True
 
-    # Log the startup event after the writer is running.
+    # Log the startup event after the writer is running, before the normal
+    # init message so the log clearly shows when the app starts.
+    log_info(_SELF, "Startup-Application Started / Initialized")
     log_info(_SELF, "Logging initialised. Log dir: %s | Days to keep: %s | Log level: %s", _log_dir, _days_to_keep, _log_level)
 
 

@@ -4,3 +4,5 @@ build/
 **/__pycache__/
 *.csv
 venv/
+tests/
+*.log

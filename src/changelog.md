@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.0.36] - 2026-10-07
+
+### Fixed
+- **Logging**: Added start/stop logs.
+
+## [1.0.35] - 2026-10-07
+
+### Fixed
+- **Keyboard actions**: Fixed the saved setting so the feature no longer gets forced back on, and stopped repeated reset loops when the function keys temporarily lose their exclusive binding.
+
 ## [1.0.34] - 2026-10-06
 
 ### Fixed

@@ -502,6 +502,13 @@ class KeyboardActionsService:
         self._last_probe_time: float = 0.0
         self._probe_cooldown: float = 5.0  # seconds between probes
 
+        # Recovery attempts can happen in quick succession when the same
+        # physical key-state remains active during a rebuild.  Treat any key
+        # that triggered a rebuild as temporarily cooled down so the delivery
+        # monitor cannot hammer the reset path repeatedly for the same event.
+        self._last_recovery_time: float = 0.0
+        self._recovery_cooldown_s: float = 1.5
+
         log_info(_MOD, "Service instance created.")
 
     def _enqueue_hook_action(self, action, generation: int, key: str) -> None:
@@ -587,8 +594,18 @@ class KeyboardActionsService:
                 ).start()
             last_dispatch_seen[key] = dispatched_at
 
-    @staticmethod
-    def _recover_missing_function_key(include_actions: bool, key: str) -> None:
+    def _recover_missing_function_key(self, include_actions: bool, key: str) -> None:
+        now = time.monotonic()
+        if now - self._last_recovery_time < self._recovery_cooldown_s:
+            log_warning(
+                _MOD,
+                "Skipping repeated function-key recovery for %s; a reset was already triggered %.2fs ago.",
+                key,
+                now - self._last_recovery_time,
+            )
+            return
+
+        self._last_recovery_time = now
         try:
             reset_function_key_bindings(
                 include_keyboard_actions=include_actions,
@@ -1451,6 +1468,11 @@ def get_service() -> KeyboardActionsService | None:
     return _service
 
 
+def _get_enabled_state(config_manager) -> bool:
+    """Return the persisted Keyboard Actions enabled state, defaulting to True."""
+    return config_manager.get_bool("keyboardActions", "enabled", True)
+
+
 def _get_autoclick_service():
     """Return the running AutoClick service (owner of the F6 hook) or None.
 
@@ -1566,10 +1588,9 @@ def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
     ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 10))
 
     # --- Enable / Disable toggle (topmost control) -----------------------
-    # Read persisted enabled state; default to True for backwards-compat.
-    _enabled_default = True
-    config_manager.set_config("keyboardActions", "enabled", "True")
-    enabled_var = tk.BooleanVar(value=_enabled_default)
+    # Respect the saved config state instead of forcing Keyboard Actions on.
+    enabled_default = _get_enabled_state(config_manager)
+    enabled_var = tk.BooleanVar(value=enabled_default)
 
     toggle_frame = ttk.Frame(frame)
     toggle_frame.grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 14))
@@ -1794,7 +1815,7 @@ def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
     if not _DEPS_AVAILABLE:
         status_text = "⚠  pynput / keyboard not installed — Keyboard Actions disabled."
         status_color = "#cc4444"
-    elif _enabled_default:
+    elif enabled_default:
         status_text = "Service running. Hotkeys are active system-wide."
         status_color = "#228822"
     else:
@@ -1813,7 +1834,7 @@ def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
     frame.columnconfigure(2, weight=1)
 
     # --- Start service thread only if enabled ----------------------------
-    if _enabled_default and _service:
+    if enabled_default and _service:
         try:
             _service.start()
             log_info(_MOD, "Service started (enabled at startup).")
