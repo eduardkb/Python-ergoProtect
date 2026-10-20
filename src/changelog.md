@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.0.38] - 2026-10-20
+
+### Improved
+- **Function keys**: Added delivery monitoring and automatic recovery for F6-F10, and made Reset Key Bindings re-enable Keyboard Actions when needed without freezing the window.
+
 ## [1.0.36] - 2026-10-07
 
 ### Fixed

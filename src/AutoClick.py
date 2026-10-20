@@ -101,6 +101,16 @@ class AutoClickService:
         self._hook_action_queue: queue.SimpleQueue = queue.SimpleQueue()
         self._binding_generation = 0
         self._hotkey_actions_enabled = False
+        self._run_function_key_operation = None
+        try:
+            from src import KeyboardActions as keyboard_actions
+        except ImportError:
+            try:
+                import KeyboardActions as keyboard_actions
+            except ImportError:
+                keyboard_actions = None
+        if keyboard_actions is not None:
+            self._run_function_key_operation = keyboard_actions.run_function_key_operation
         self._hook_action_thread = threading.Thread(
             target=self._hook_action_loop,
             name="AutoClickHookWorker",
@@ -151,6 +161,12 @@ class AutoClickService:
             generation = self._hook_action_queue.get()
             try:
                 if self._hotkey_actions_enabled and generation == self._binding_generation:
+                    if self._run_function_key_operation is not None:
+                        try:
+                            from src import KeyboardActions as keyboard_actions
+                        except ImportError:
+                            import KeyboardActions as keyboard_actions
+                        keyboard_actions.report_function_key_delivery(self._hotkey_key or "F6")
                     self.toggle()
             except Exception:
                 log_error(_MOD, "Queued AutoClick hotkey action failed.", exc_info=True)
@@ -248,6 +264,11 @@ class AutoClickService:
     # ------------------------------------------------------------------
 
     def _register_hotkey(self) -> None:
+        if self._run_function_key_operation is None:
+            raise RuntimeError("Shared function-key coordinator is unavailable.")
+        return self._run_function_key_operation(self._register_hotkey_owned)
+
+    def _register_hotkey_owned(self) -> None:
         """
         Register an exclusive suppressed hotkey for the activate/deactivate key.
 
@@ -299,6 +320,11 @@ class AutoClickService:
                     log_error(_MOD, "Could not register AutoClick hotkey '%s'.", key, exc_info=True)
 
     def _unregister_hotkey(self) -> None:
+        if self._run_function_key_operation is None:
+            raise RuntimeError("Shared function-key coordinator is unavailable.")
+        return self._run_function_key_operation(self._unregister_hotkey_owned)
+
+    def _unregister_hotkey_owned(self) -> None:
         """
         Remove only this module's hotkey callback, leaving all other hooks intact.
 
@@ -321,18 +347,11 @@ class AutoClickService:
                 kb_lib.remove_hotkey(self._hotkey_handler)
                 log_info(_MOD, "✓ F6 AutoClick hotkey '%s' unregistered successfully", key_name)
             except Exception as e:
-                # Handler may already be gone (e.g. after hibernation hook reset).
-                key_name = self._hotkey_key or "F6"
-                log_warning(
-                    _MOD,
-                    "⚠️  remove_hotkey() failed for '%s' (may already be removed): %s",
-                    key_name,
-                    str(e)
-                )
-            finally:
-                hotkey_logger.hotkey_unregistered(key_name)
-                self._hotkey_handler = None
-                self._hotkey_key = ""
+                log_error(_MOD, "F6 removal failed at stage unregister for '%s'.", key_name, exc_info=True)
+                raise RuntimeError("Could not unregister the AutoClick hotkey") from e
+            hotkey_logger.hotkey_unregistered(key_name)
+            self._hotkey_handler = None
+            self._hotkey_key = ""
 
     # ------------------------------------------------------------------
     # Watchdog loop — detects dead monitor thread (e.g. after hibernation)
@@ -747,7 +766,9 @@ def create_tab(parent: tk.Widget, config_manager) -> tk.Frame:
                     log_error(_MOD, "KeyboardActions module not found - function-key reset skipped.")
             if _ka_mod is not None:
                 try:
-                    _ka_mod.reset_function_key_bindings(include_keyboard_actions=True)
+                    _ka_mod.reset_function_key_bindings(
+                        include_keyboard_actions=True, reason="AutoClick enabled"
+                    )
                 except Exception:
                     log_error(_MOD, "Shared function-key reset failed from AutoClick toggle.", exc_info=True)
         else:

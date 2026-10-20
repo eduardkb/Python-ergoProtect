@@ -30,13 +30,13 @@ via a configurable hotkey at any time.
 
 ## Features
 
-| Module            | Status      | Description                                              |
-|-------------------|-------------|----------------------------------------------------------|
+| Module            | Status       | Description                                              |
+|-------------------|--------------|----------------------------------------------------------|
 | AutoClick         | ✅ Available | Clicks automatically when the cursor is held still.      |
-| Keyboard Actions  | 🔜 Planned  | Remap frequent shortcuts to reduce finger strain.        |
-| Usage Log         | 🔜 Planned  | Track daily click and keystroke counts.                  |
-| Usage Graphics    | 🔜 Planned  | Visualise usage patterns over time.                      |
-| Rest Reminder     | 🔜 Planned  | Alert you to take regular hand-rest breaks.              |
+| Keyboard Actions  | ✅ Available | Remap frequent shortcuts to reduce finger strain.        |
+| Usage Log         | 🔜 Planned   | Track daily click and keystroke counts.                  |
+| Usage Graphics    | 🔜 Planned   | Visualise usage patterns over time.                      |
+| Rest Reminder     | ✅ Available | Alert you to take regular hand-rest breaks.              |
 
 ---
 
