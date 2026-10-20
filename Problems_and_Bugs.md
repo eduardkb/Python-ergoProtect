@@ -1,7 +1,7 @@
 # Next ToDo's
 
 - Problems                
-    - 
+    - on "keyboard actions" screen, improve monitoring (message on end of the screen.) remove "Other bingings remain unverified" message.
 
 - Bugs:
     
